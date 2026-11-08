@@ -67,4 +67,8 @@ https://odysee.com/$/rss/@STRATPOL:d
 https://odysee.com/$/rss/@neonews_fr:5
 
 # --- Sites ---
+# --- Autres sites (ex RSS bot) ---
+https://www.phoenixjp.info/rss/numeriques-1.xml
+https://www.phoenixjp.info/rss/professionnel.xml
+https://www.francebleu.fr/rss/provence/a-la-une.xml
 https://frenchbreaches.com/blog/feed.xml
