@@ -2,8 +2,8 @@ import html, json, os, re, time, requests, feedparser
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT"]
-DELAI = 60        # secondes entre deux articles
-MAX_PAR_RUN = 10    # articles envoyes a chaque passage
+DELAI = 60         # secondes entre deux articles
+MAX_PAR_RUN = 10   # articles envoyes a chaque passage
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 
 FEEDS = [l.strip() for l in open("feeds.txt") if l.strip() and not l.startswith("#")]
@@ -21,9 +21,12 @@ except FileNotFoundError:
     etat = {"vus": [], "file": [], "init": False}
 etat.setdefault("yt", {})
 
-# Migration : les flux deja suivis avant l'ajout de la liste "feeds" restent connus
-if "feeds" not in etat:
-    etat["feeds"] = [u for u in FEEDS if not GDATA.match(u)] if etat["init"] else []
+# Remise a zero de la liste des flux connus et de la file (version 2) :
+# un flux n'est "connu" qu'apres avoir reussi a fournir des articles au moins une fois
+if etat.get("v") != 2:
+    etat["feeds"] = []
+    etat["file"] = []
+    etat["v"] = 2
 
 
 def entrees(url):
@@ -32,11 +35,9 @@ def entrees(url):
     if not m:
         return feedparser.parse(url, agent=UA).entries
     nom = m.group(1)
-    # 1) ancienne methode YouTube : flux par nom d'utilisateur
     d = feedparser.parse("https://www.youtube.com/feeds/videos.xml?user=" + nom, agent=UA)
     if d.entries:
         return d.entries
-    # 2) sinon, on cherche l'identifiant de la chaine dans la page
     if nom not in etat["yt"]:
         try:
             r = requests.get("https://www.youtube.com/user/" + nom,
@@ -56,13 +57,29 @@ def entrees(url):
     return []
 
 
-premier = not etat["init"]
+def oembed(link):
+    """Diagnostic : YouTube accepte-t-il de decrire cette video ? (200 = oui)"""
+    if "youtube.com" not in link and "youtu.be" not in link:
+        return "-"
+    try:
+        r = requests.get("https://www.youtube.com/oembed",
+                         params={"url": link, "format": "json"},
+                         headers={"User-Agent": UA}, timeout=15)
+        return str(r.status_code)
+    except Exception:
+        return "erreur"
+
+
 vus = dict.fromkeys(etat["vus"])
 for url in FEEDS:
-    liste = entrees(url)
-    # un flux jamais vu est memorise sans etre publie (evite l'inondation)
-    silencieux = premier or url not in etat["feeds"]
-    if liste and url not in etat["feeds"]:
+    try:
+        liste = entrees(url)
+    except Exception as e:
+        print("Erreur flux", url, e)
+        liste = []
+    # un flux jamais vu avec des articles est memorise sans etre publie
+    silencieux = url not in etat["feeds"]
+    if liste and silencieux:
         etat["feeds"].append(url)
     for e in reversed(liste):
         uid = e.get("id") or e.get("link")
@@ -70,23 +87,58 @@ for url in FEEDS:
             vus[uid] = None
             if not silencieux:
                 titre = html.escape(e.get("title", ""))
-                etat["file"].append(f"<b>{titre}</b>\n{e.get('link', '')}")
+                lien = e.get("link", "")
+                etat["file"].append({"text": f"<b>{titre}</b>\n{lien}",
+                                     "link": lien, "pub": e.get("published", "")})
 etat["init"] = True
+DEBUT = time.time()
+
+
+def save():
+    etat["vus"] = list(vus)[-5000:]
+    json.dump(etat, open("state.json", "w"))
+
+
+def envoyer(item):
+    """Envoie un message ; reessaie en cas de coupure reseau ou de limite Telegram."""
+    for essai in range(3):
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                data={"chat_id": CHAT_ID, "text": item["text"], "parse_mode": "HTML"},
+                timeout=30,
+            )
+        except Exception as e:
+            print("Erreur reseau Telegram :", e)
+            time.sleep(5)
+            continue
+        if r.ok:
+            return True
+        if r.status_code == 429:
+            try:
+                attente = r.json()["parameters"]["retry_after"]
+            except Exception:
+                attente = 30
+            print("Limite Telegram, attente de", attente, "s")
+            time.sleep(min(attente, 60))
+            continue
+        print(r.text)
+        return False
+    return False
+
+
+save()  # on memorise les flux et la file avant d'envoyer
 
 envoyes = 0
-while etat["file"] and envoyes < MAX_PAR_RUN:
+while etat["file"] and envoyes < MAX_PAR_RUN and time.time() - DEBUT < 11 * 60:
     if envoyes:
         time.sleep(DELAI)
-    r = requests.post(
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": etat["file"][0], "parse_mode": "HTML"},
-        timeout=30,
-    )
-    if not r.ok:
-        print(r.text)
+    item = etat["file"][0]
+    if not envoyer(item):
         break
+    print("ENVOYE | publie:", item.get("pub") or "?", "| oembed:", oembed(item["link"]), "|", item["link"])
     etat["file"].pop(0)
     envoyes += 1
+    save()  # sauvegarde apres chaque message : plus de doublon si le script s'arrete
 
-etat["vus"] = list(vus)[-5000:]
-json.dump(etat, open("state.json", "w"))
+save()
