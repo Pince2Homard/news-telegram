@@ -128,6 +128,7 @@ def envoyer(item):
 
 
 save()  # on memorise les flux et la file avant d'envoyer
+print("FILE D'ATTENTE avant envoi :", len(etat["file"]), "article(s)")
 
 envoyes = 0
 while etat["file"] and envoyes < MAX_PAR_RUN and time.time() - DEBUT < 11 * 60:
@@ -142,3 +143,7 @@ while etat["file"] and envoyes < MAX_PAR_RUN and time.time() - DEBUT < 11 * 60:
     save()  # sauvegarde apres chaque message : plus de doublon si le script s'arrete
 
 save()
+reste = etat["file"]
+print("FILE D'ATTENTE apres envoi :", len(reste), "article(s) |",
+      envoyes, "envoye(s) ce passage | plus ancien en attente, publie :",
+      (reste[0].get("pub") or "?") if reste else "-")
