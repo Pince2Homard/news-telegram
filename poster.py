@@ -2,8 +2,10 @@ import html, json, os, re, time, requests, feedparser
 
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT"]
-DELAI = 60         # secondes entre deux articles
-MAX_PAR_RUN = 10   # articles envoyes a chaque passage
+DELAI = 60         # secondes entre deux articles (rythme normal)
+DELAI_RAPIDE = 30  # secondes entre deux articles quand la file est longue
+SEUIL_RAPIDE = 8   # au-dela de ce nombre d'articles en attente, on accelere
+MAX_PAR_RUN = 25   # articles envoyes au maximum a chaque passage
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 
 FEEDS = [l.strip() for l in open("feeds.txt") if l.strip() and not l.startswith("#")]
@@ -133,7 +135,7 @@ print("FILE D'ATTENTE avant envoi :", len(etat["file"]), "article(s)")
 envoyes = 0
 while etat["file"] and envoyes < MAX_PAR_RUN and time.time() - DEBUT < 11 * 60:
     if envoyes:
-        time.sleep(DELAI)
+        time.sleep(DELAI_RAPIDE if len(etat["file"]) > SEUIL_RAPIDE else DELAI)
     item = etat["file"][0]
     if not envoyer(item):
         break
