@@ -1,15 +1,21 @@
-import html, json, os, re, time, requests, feedparser
+"""Collecte de flux et diffusion Telegram, avec publication verrouillée par défaut."""
+import html
+import json
+import os
+import re
+import tempfile
+import time
+from pathlib import Path
+from urllib.parse import urlparse
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT"]
-DELAI = 15         # secondes entre deux articles
-DELAI_RAPIDE = 15  # (meme valeur : plus de rythme different quand la file est longue)
+import feedparser
+import requests
+
+DELAI = 15
+DELAI_RAPIDE = 15
 SEUIL_RAPIDE = 8
-MAX_PAR_RUN = 50   # articles envoyes au maximum a chaque passage (limite aussi par le temps)
+MAX_PAR_RUN = 50
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-
-FEEDS = [l.strip() for l in open("feeds.txt") if l.strip() and not l.startswith("#")]
-
 GDATA = re.compile(r"https?://gdata\.youtube\.com/feeds/base/users/([^/]+)/uploads")
 MOTIFS = [
     r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
@@ -17,135 +23,254 @@ MOTIFS = [
     r'itemprop="channelId" content="(UC[\w-]{22})"',
 ]
 
-try:
-    etat = json.load(open("state.json"))
-except FileNotFoundError:
-    etat = {"vus": [], "file": [], "init": False}
-etat.setdefault("yt", {})
 
-# Remise a zero de la liste des flux connus et de la file (version 2) :
-# un flux n'est "connu" qu'apres avoir reussi a fournir des articles au moins une fois
-if etat.get("v") != 2:
-    etat["feeds"] = []
-    etat["file"] = []
-    etat["v"] = 2
+def load_feeds(path="feeds.txt"):
+    with open(path, encoding="utf-8") as source:
+        return [
+            line.strip() for line in source
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
 
 
-def entrees(url):
-    """Retourne les articles d'un flux (gere les anciennes adresses YouTube)."""
-    m = GDATA.match(url)
-    if not m:
-        return feedparser.parse(url, agent=UA).entries
-    nom = m.group(1)
-    d = feedparser.parse("https://www.youtube.com/feeds/videos.xml?user=" + nom, agent=UA)
-    if d.entries:
-        return d.entries
-    if nom not in etat["yt"]:
+def load_state(path="state.json"):
+    try:
+        with open(path, encoding="utf-8") as source:
+            state = json.load(source)
+    except FileNotFoundError:
+        state = {"vus": [], "file": [], "init": False}
+
+    if not isinstance(state, dict):
+        raise ValueError("state.json doit contenir un objet JSON")
+    state.setdefault("vus", [])
+    state.setdefault("file", [])
+    state.setdefault("feeds", [])
+    state.setdefault("yt", {})
+    state.setdefault("init", False)
+    if not isinstance(state["vus"], list) or not isinstance(state["file"], list):
+        raise ValueError("Format invalide dans state.json : listes 'vus' et 'file' requises")
+    if not isinstance(state["feeds"], list) or not isinstance(state["yt"], dict):
+        raise ValueError("Format invalide dans state.json : 'feeds' ou 'yt'")
+
+    # Migration non destructive : ne jamais effacer la file d'attente existante.
+    if state.get("v") != 2:
+        state["v"] = 2
+    return state
+
+
+def save_state(state, seen, path="state.json"):
+    """Écriture atomique : un arrêt ne laisse pas un JSON partiellement écrit."""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    state["vus"] = list(seen)[-5000:]
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=str(target.parent),
+            prefix=f".{target.name}.", suffix=".tmp", delete=False,
+        ) as temp:
+            temp_path = temp.name
+            json.dump(state, temp, ensure_ascii=False, separators=(",", ":"))
+            temp.flush()
+            os.fsync(temp.fileno())
+        os.replace(temp_path, target)
+        # Synchroniser le répertoire améliore la durabilité du remplacement atomique.
         try:
-            r = requests.get("https://www.youtube.com/user/" + nom,
-                             headers={"User-Agent": UA, "Accept-Language": "fr"},
-                             cookies={"CONSENT": "YES+1"}, timeout=30)
-            for motif in MOTIFS:
-                f = re.search(motif, r.text)
-                if f:
-                    etat["yt"][nom] = f.group(1)
+            directory_fd = os.open(str(target.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+def is_http_url(value):
+    try:
+        parsed = urlparse(value)
+        return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+    except (TypeError, ValueError):
+        return False
+
+
+def format_item(entry):
+    title = html.escape(str(entry.get("title") or "(sans titre)"))
+    link = str(entry.get("link") or "").strip()
+    if not is_http_url(link):
+        return None
+    return {
+        "text": f"<b>{title}</b>\n{html.escape(link)}",
+        "link": link,
+        "pub": str(entry.get("published") or ""),
+    }
+
+
+def entries_for_feed(url, state, http=requests, parser=feedparser.parse):
+    match = GDATA.match(url)
+    if not match:
+        return parser(url, agent=UA).entries
+
+    username = match.group(1)
+    data = parser("https://www.youtube.com/feeds/videos.xml?user=" + username, agent=UA)
+    if data.entries:
+        return data.entries
+
+    if username not in state["yt"]:
+        try:
+            response = http.get(
+                "https://www.youtube.com/user/" + username,
+                headers={"User-Agent": UA, "Accept-Language": "fr"},
+                cookies={"CONSENT": "YES+1"}, timeout=30,
+            )
+            response.raise_for_status()
+            for pattern in MOTIFS:
+                found = re.search(pattern, response.text)
+                if found:
+                    state["yt"][username] = found.group(1)
                     break
-        except Exception as e:
-            print("Erreur", nom, e)
-    if nom in etat["yt"]:
-        d = feedparser.parse("https://www.youtube.com/feeds/videos.xml?channel_id=" + etat["yt"][nom], agent=UA)
-        return d.entries
-    print("Chaine YouTube non resolue :", nom)
+        except requests.RequestException as exc:
+            print("Erreur résolution YouTube", username, exc)
+
+    if username in state["yt"]:
+        data = parser(
+            "https://www.youtube.com/feeds/videos.xml?channel_id=" + state["yt"][username],
+            agent=UA,
+        )
+        return data.entries
+    print("Chaîne YouTube non résolue :", username)
     return []
 
 
-def oembed(link):
-    """Diagnostic : YouTube accepte-t-il de decrire cette video ? (200 = oui)"""
-    if "youtube.com" not in link and "youtu.be" not in link:
-        return "-"
-    try:
-        r = requests.get("https://www.youtube.com/oembed",
-                         params={"url": link, "format": "json"},
-                         headers={"User-Agent": UA}, timeout=15)
-        return str(r.status_code)
-    except Exception:
-        return "erreur"
-
-
-vus = dict.fromkeys(etat["vus"])
-for url in FEEDS:
-    try:
-        liste = entrees(url)
-    except Exception as e:
-        print("Erreur flux", url, e)
-        liste = []
-    # un flux jamais vu avec des articles est memorise sans etre publie
-    silencieux = url not in etat["feeds"]
-    if liste and silencieux:
-        etat["feeds"].append(url)
-    for e in reversed(liste):
-        uid = e.get("id") or e.get("link")
-        if uid and uid not in vus:
-            vus[uid] = None
-            if not silencieux:
-                titre = html.escape(e.get("title", ""))
-                lien = e.get("link", "")
-                etat["file"].append({"text": f"<b>{titre}</b>\n{lien}",
-                                     "link": lien, "pub": e.get("published", "")})
-etat["init"] = True
-DEBUT = time.time()
-
-
-def save():
-    etat["vus"] = list(vus)[-5000:]
-    json.dump(etat, open("state.json", "w"))
-
-
-def envoyer(item):
-    """Envoie un message ; reessaie en cas de coupure reseau ou de limite Telegram."""
-    for essai in range(3):
+def collect_articles(feeds, state, http=requests, parser=feedparser.parse):
+    seen = dict.fromkeys(state["vus"])
+    for url in feeds:
         try:
-            r = requests.post(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                data={"chat_id": CHAT_ID, "text": item["text"], "parse_mode": "HTML"},
+            entries = entries_for_feed(url, state, http=http, parser=parser)
+        except Exception as exc:
+            print("Erreur flux", url, exc)
+            continue
+
+        silent = url not in state["feeds"]
+        if entries and silent:
+            state["feeds"].append(url)
+
+        for entry in reversed(entries):
+            uid = entry.get("id") or entry.get("link")
+            if not uid:
+                continue
+            uid = str(uid)
+            if uid in seen:
+                continue
+
+            # Ne marquer comme vu qu'un article dont le lien est publiable.
+            item = format_item(entry)
+            if item is None:
+                print("Article ignoré : lien HTTP(S) absent ou invalide :", uid)
+                continue
+
+            seen[uid] = None
+            if not silent:
+                state["file"].append(item)
+
+    state["init"] = True
+    return seen
+
+
+def send_message(item, token, chat_id, http=requests, sleep=time.sleep):
+    for attempt in range(3):
+        try:
+            response = http.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                data={"chat_id": chat_id, "text": item["text"], "parse_mode": "HTML"},
                 timeout=30,
             )
-        except Exception as e:
-            print("Erreur reseau Telegram :", e)
-            time.sleep(5)
-            continue
-        if r.ok:
+        except requests.RequestException as exc:
+            # Résultat ambigu : Telegram a peut-être reçu le message.
+            # Ne pas réessayer automatiquement pour éviter un doublon.
+            print("Résultat d'envoi Telegram incertain, aucun nouvel essai :", exc)
+            return False
+
+        if response.ok:
             return True
-        if r.status_code == 429:
+        if response.status_code == 429:
             try:
-                attente = r.json()["parameters"]["retry_after"]
-            except Exception:
-                attente = 30
-            print("Limite Telegram, attente de", attente, "s")
-            time.sleep(min(attente, 60))
+                wait = int(response.json()["parameters"]["retry_after"])
+            except (KeyError, TypeError, ValueError):
+                wait = 30
+            print("Limite Telegram, attente de", wait, "s")
+            if attempt < 2:
+                sleep(min(max(wait, 1), 60))
             continue
-        print(r.text)
+
+        print("Erreur Telegram HTTP", response.status_code, response.text[:500])
         return False
     return False
 
 
-save()  # on memorise les flux et la file avant d'envoyer
-print("FILE D'ATTENTE avant envoi :", len(etat["file"]), "article(s)")
+def process_queue(
+    state, seen, token, chat_id, state_path="state.json", dry_run=True,
+    sender=send_message, sleep=time.sleep, max_per_run=MAX_PAR_RUN,
+    delay=DELAI, fast_delay=DELAI_RAPIDE, fast_threshold=SEUIL_RAPIDE,
+    time_limit=11 * 60, clock=time.time,
+):
+    if dry_run:
+        print("DRY-RUN : aucune requête Telegram et aucune sauvegarde.")
+        for item in state["file"]:
+            print("SIMULATION |", item.get("pub") or "?", "|", item.get("link", ""))
+        return 0
 
-envoyes = 0
-while etat["file"] and envoyes < MAX_PAR_RUN and time.time() - DEBUT < 11 * 60:
-    if envoyes:
-        time.sleep(DELAI_RAPIDE if len(etat["file"]) > SEUIL_RAPIDE else DELAI)
-    item = etat["file"][0]
-    if not envoyer(item):
-        break
-    print("ENVOYE | publie:", item.get("pub") or "?", "|", item["link"])
-    etat["file"].pop(0)
-    envoyes += 1
-    save()  # sauvegarde apres chaque message : plus de doublon si le script s'arrete
+    # La file et les identifiants sont persistés avant toute tentative d'envoi.
+    save_state(state, seen, state_path)
+    started = clock()
+    sent = 0
+    while state["file"] and sent < max_per_run and clock() - started < time_limit:
+        if sent:
+            sleep(fast_delay if len(state["file"]) > fast_threshold else delay)
+        item = state["file"][0]
+        if not sender(item, token, chat_id):
+            # Conserver le premier article : il sera réexaminé au prochain passage.
+            break
+        print("ENVOYÉ | publié:", item.get("pub") or "?", "|", item["link"])
+        state["file"].pop(0)
+        sent += 1
+        save_state(state, seen, state_path)
 
-save()
-reste = etat["file"]
-print("FILE D'ATTENTE apres envoi :", len(reste), "article(s) |",
-      envoyes, "envoye(s) ce passage | plus ancien en attente, publie :",
-      (reste[0].get("pub") or "?") if reste else "-")
+    save_state(state, seen, state_path)
+    remaining = state["file"]
+    print(
+        "FILE D'ATTENTE après envoi :", len(remaining), "article(s) |",
+        sent, "envoyé(s) ce passage | plus ancien en attente, publié :",
+        (remaining[0].get("pub") or "?") if remaining else "-",
+    )
+    return sent
+
+
+def main():
+    # Double verrou : sans ALLOW_TELEGRAM_SEND=1, publication impossible.
+    # DRY_RUN=1 reste prioritaire même si l'autorisation est présente.
+    dry_run = os.getenv("DRY_RUN", "1").strip().lower() in ("1", "true", "yes")
+    allow_send = os.getenv("ALLOW_TELEGRAM_SEND") == "1"
+    if not allow_send:
+        dry_run = True
+
+    feeds = load_feeds(os.getenv("FEEDS_FILE", "feeds.txt"))
+    state_path = os.getenv("STATE_FILE", "state.json")
+    state = load_state(state_path)
+    seen = collect_articles(feeds, state)
+
+    print("FILE D'ATTENTE avant traitement :", len(state["file"]), "article(s)")
+    if dry_run:
+        process_queue(state, seen, None, None, state_path=state_path, dry_run=True)
+        return
+
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT")
+    if not token or not chat_id:
+        raise RuntimeError("Publication refusée : TELEGRAM_TOKEN et TELEGRAM_CHAT sont requis.")
+    process_queue(state, seen, token, chat_id, state_path=state_path, dry_run=False)
+
+
+if __name__ == "__main__":
+    main()

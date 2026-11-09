@@ -1,37 +1,56 @@
 name: Poster news
+
 on:
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
+
 concurrency:
-  group: poster
+  group: poster-production
   cancel-in-progress: false
+
 permissions:
   contents: write
+
 jobs:
   poster:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 14
     steps:
-      - uses: actions/checkout@v4
+      - name: Récupérer le code de production
+        uses: actions/checkout@v4
         with:
           ref: main
-      - uses: actions/setup-python@v5
+      - name: Installer Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install feedparser requests
-      - run: python poster.py
+      - name: Installer les dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Publier les articles
+        run: python poster.py
         env:
+          DRY_RUN: "0"
+          ALLOW_TELEGRAM_SEND: "1"
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
-      - if: always()
+      - name: Sauvegarder l'état de la file d'attente
+        if: always()
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           git add state.json
-          git commit -m "etat" || exit 0
-          for i in 1 2 3 4 5; do
+          if git diff --cached --quiet; then
+            echo "Aucun changement d'état à enregistrer."
+            exit 0
+          fi
+          git commit -m "État du bot"
+          for attempt in 1 2 3 4 5; do
             git pull --rebase origin main && git push && exit 0
             sleep 5
           done
+          echo "Impossible de sauvegarder state.json après 5 tentatives."
           exit 1
