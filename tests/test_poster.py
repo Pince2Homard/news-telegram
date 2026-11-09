@@ -1,16 +1,34 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import requests
 import poster
 
 
 class PosterSafetyTests(unittest.TestCase):
-    def test_publication_is_disabled_by_default(self):
-        # Le point d'entrée ne peut envoyer sans ALLOW_TELEGRAM_SEND=1.
-        self.assertNotEqual(__import__("os").environ.get("ALLOW_TELEGRAM_SEND"), "1")
+    def test_main_is_dry_run_without_explicit_send_permission(self):
+        with patch.dict(os.environ, {"DRY_RUN": "0"}, clear=True):
+            with patch.object(poster, "load_feeds", return_value=[]), \
+                 patch.object(poster, "load_state", return_value={"vus": [], "file": [], "feeds": [], "yt": {}}), \
+                 patch.object(poster, "collect_articles", return_value={}), \
+                 patch.object(poster, "process_queue") as process:
+                poster.main()
+        self.assertTrue(process.call_args.kwargs["dry_run"])
+        self.assertIsNone(process.call_args.args[2])
+
+    def test_main_requires_credentials_when_send_is_explicitly_enabled(self):
+        with patch.dict(os.environ, {"DRY_RUN": "0", "ALLOW_TELEGRAM_SEND": "1"}, clear=True):
+            with patch.object(poster, "load_feeds", return_value=[]), \
+                 patch.object(poster, "load_state", return_value={"vus": [], "file": [], "feeds": [], "yt": {}}), \
+                 patch.object(poster, "collect_articles", return_value={}), \
+                 patch.object(poster, "process_queue") as process:
+                with self.assertRaisesRegex(RuntimeError, "TELEGRAM_TOKEN"):
+                    poster.main()
+        process.assert_not_called()
 
     def test_format_item_escapes_html_and_rejects_invalid_urls(self):
         item = poster.format_item({
@@ -20,6 +38,7 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", item["text"])
         self.assertIn("&amp;", item["text"])
         self.assertIsNone(poster.format_item({"title": "bad", "link": "javascript:alert(1)"}))
+        self.assertIsNone(poster.format_item({"title": "bad", "link": ""}))
 
     def test_dry_run_never_calls_sender_or_writes_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -34,7 +53,7 @@ class PosterSafetyTests(unittest.TestCase):
             sender.assert_not_called()
             self.assertFalse(Path(state_path).exists())
 
-    def test_state_is_written_as_valid_json(self):
+    def test_state_is_written_as_valid_json_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             state = {"file": [], "feeds": [], "yt": {}, "v": 2}
@@ -50,16 +69,80 @@ class PosterSafetyTests(unittest.TestCase):
             with self.assertRaises(json.JSONDecodeError):
                 poster.load_state(str(path))
 
-    def test_send_message_success_uses_supplied_test_transport(self):
-        response = Mock(ok=True, status_code=200)
-        transport = Mock(post=Mock(return_value=response))
-        self.assertTrue(poster.send_message(
-            {"text": "test"}, "fake-token", "fake-chat",
-            http=transport, sleep=Mock(),
+    def test_state_migration_preserves_pending_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            pending = [{"text": "<b>à publier</b>", "link": "https://example.org", "pub": ""}]
+            path.write_text(json.dumps({"vus": ["old"], "file": pending, "feeds": ["feed"], "v": 1}))
+            migrated = poster.load_state(str(path))
+            self.assertEqual(migrated["v"], 2)
+            self.assertEqual(migrated["file"], pending)
+            self.assertEqual(migrated["feeds"], ["feed"])
+
+    def test_invalid_article_link_is_not_marked_seen_or_queued(self):
+        feed = "https://example.org/feed"
+        parser = Mock(return_value=Mock(entries=[
+            {"id": "bad-article", "title": "Sans lien", "link": "javascript:alert(1)"},
+            {"id": "good-article", "title": "Valide", "link": "https://example.org/article"},
+        ]))
+        state = {"vus": [], "file": [], "feeds": [feed], "yt": {}}
+        seen = poster.collect_articles([feed], state, parser=parser)
+        self.assertNotIn("bad-article", seen)
+        self.assertIn("good-article", seen)
+        self.assertEqual(len(state["file"]), 1)
+
+    def test_send_message_does_not_retry_ambiguous_network_failure(self):
+        transport = Mock()
+        transport.post.side_effect = requests.Timeout("timeout")
+        sleeper = Mock()
+        self.assertFalse(poster.send_message(
+            {"text": "test"}, "fake-token", "fake-chat", http=transport, sleep=sleeper,
         ))
         transport.post.assert_called_once()
-        self.assertIn("fake-token", transport.post.call_args.args[0])
-        self.assertEqual(transport.post.call_args.kwargs["data"]["chat_id"], "fake-chat")
+        sleeper.assert_not_called()
+
+    def test_send_message_retries_only_explicit_telegram_rate_limit(self):
+        rate_limit = Mock(ok=False, status_code=429)
+        rate_limit.json.return_value = {"parameters": {"retry_after": 2}}
+        success = Mock(ok=True, status_code=200)
+        transport = Mock()
+        transport.post.side_effect = [rate_limit, success]
+        sleeper = Mock()
+        self.assertTrue(poster.send_message(
+            {"text": "test"}, "fake-token", "fake-chat", http=transport, sleep=sleeper,
+        ))
+        self.assertEqual(transport.post.call_count, 2)
+        sleeper.assert_called_once_with(2)
+
+    def test_failed_send_keeps_item_in_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            item = {"text": "test", "link": "https://example.org", "pub": ""}
+            state = {"vus": [], "file": [item], "feeds": [], "yt": {}, "v": 2}
+            sender = Mock(return_value=False)
+            sent = poster.process_queue(
+                state, {}, "token", "chat", state_path=path, dry_run=False, sender=sender,
+            )
+            self.assertEqual(sent, 0)
+            self.assertEqual(state["file"], [item])
+            saved = json.loads(Path(path).read_text())
+            self.assertEqual(saved["file"], [item])
+
+    def test_successful_send_removes_only_confirmed_item(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            first = {"text": "one", "link": "https://example.org/1", "pub": ""}
+            second = {"text": "two", "link": "https://example.org/2", "pub": ""}
+            state = {"vus": [], "file": [first, second], "feeds": [], "yt": {}, "v": 2}
+            sender = Mock(side_effect=[True, False])
+            sent = poster.process_queue(
+                state, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=sender, delay=0, max_per_run=5,
+            )
+            self.assertEqual(sent, 1)
+            self.assertEqual(state["file"], [second])
+            saved = json.loads(Path(path).read_text())
+            self.assertEqual(saved["file"], [second])
 
 
 if __name__ == "__main__":
