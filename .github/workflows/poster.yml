@@ -1,7 +1,13 @@
-name: Simulation news (aucun envoi)
+name: Simulation news (envoi de test facultatif)
 
 on:
   workflow_dispatch:
+    inputs:
+      send_test_message:
+        description: "Envoyer UN message de contrôle au canal de test"
+        required: true
+        type: boolean
+        default: false
 
 concurrency:
   group: poster-hardening-dry-run
@@ -15,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 14
     steps:
-      - name: Récupérer uniquement la branche de test
+      - name: Récupérer uniquement la branche sélectionnée
         uses: actions/checkout@v4
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -25,9 +31,36 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Simuler la collecte et la file d'attente
+      - name: Simuler la collecte et la file d'attente (sans Telegram)
         run: python poster.py
         env:
           DRY_RUN: "1"
           STATE_FILE: state.json
           FEEDS_FILE: feeds.txt
+      - name: Envoyer un unique message de contrôle au canal de test
+        if: \${{ inputs.send_test_message }}
+        env:
+          TELEGRAM_TOKEN: \${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: \${{ secrets.TELEGRAM_CHAT }}
+        run: |
+          python - <<'PY'
+          import os
+          import requests
+
+          token = os.environ.get("TELEGRAM_TOKEN")
+          chat = os.environ.get("TELEGRAM_CHAT")
+          if not token or not chat:
+              raise SystemExit("Secrets Telegram absents : aucun message envoyé.")
+          response = requests.post(
+              f"https://api.telegram.org/bot{token}/sendMessage",
+              data={
+                  "chat_id": chat,
+                  "text": "🧪 Test technique news-telegram : connexion Telegram opérationnelle.",
+                  "disable_web_page_preview": "true",
+              },
+              timeout=20,
+          )
+          if not response.ok:
+              raise SystemExit(f"Échec Telegram HTTP {response.status_code}: {response.text[:300]}")
+          print("Message de contrôle unique envoyé au canal configuré.")
+          PY
