@@ -1,37 +1,33 @@
-name: Poster news
+name: Simulation news (aucun envoi)
+
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
+
 concurrency:
-  group: poster
+  group: poster-hardening-dry-run
   cancel-in-progress: false
+
 permissions:
-  contents: write
+  contents: read
+
 jobs:
-  poster:
+  dry-run:
     runs-on: ubuntu-latest
     timeout-minutes: 14
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-      - uses: actions/setup-python@v5
+      - name: Récupérer uniquement la branche de test
+        uses: actions/checkout@v4
+      - name: Installer Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install feedparser requests
-      - run: python poster.py
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
-      - if: always()
+      - name: Installer les dépendances
         run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add state.json
-          git commit -m "etat" || exit 0
-          for i in 1 2 3 4 5; do
-            git pull --rebase origin main && git push && exit 0
-            sleep 5
-          done
-          exit 1
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Simuler la collecte et la file d'attente
+        run: python poster.py
+        env:
+          DRY_RUN: "1"
+          STATE_FILE: state.json
+          FEEDS_FILE: feeds.txt
