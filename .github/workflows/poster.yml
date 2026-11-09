@@ -35,8 +35,8 @@ jobs:
         env:
           DRY_RUN: "0"
           ALLOW_TELEGRAM_SEND: "1"
-          TELEGRAM_TOKEN: \${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT: \${{ secrets.TELEGRAM_CHAT }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
       - name: Sauvegarder l'état de la file d'attente
         if: always()
         run: |
