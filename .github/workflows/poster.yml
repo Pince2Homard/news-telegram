@@ -38,10 +38,10 @@ jobs:
           STATE_FILE: state.json
           FEEDS_FILE: feeds.txt
       - name: Envoyer un unique message de contrôle au canal de test
-        if: \${{ inputs.send_test_message }}
+        if: ${{ inputs.send_test_message }}
         env:
-          TELEGRAM_TOKEN: \${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT: \${{ secrets.TELEGRAM_CHAT }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
         run: |
           python - <<'PY'
           import os
