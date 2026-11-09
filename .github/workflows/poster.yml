@@ -1,28 +1,27 @@
-name: Simulation news (envoi de test facultatif)
+name: Poster news
 
 on:
+  schedule:
+    - cron: "*/10 * * * *"
   workflow_dispatch:
-    inputs:
-      send_test_message:
-        description: "Envoyer UN message de contrôle au canal de test"
-        required: true
-        type: boolean
-        default: false
 
 concurrency:
-  group: poster-hardening-dry-run
+  group: poster-production
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  dry-run:
+  poster:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 14
     steps:
-      - name: Récupérer uniquement la branche sélectionnée
+      - name: Récupérer le code de production
         uses: actions/checkout@v4
+        with:
+          ref: main
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
@@ -31,36 +30,27 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Simuler la collecte et la file d'attente (sans Telegram)
+      - name: Publier les articles
         run: python poster.py
         env:
-          DRY_RUN: "1"
-          STATE_FILE: state.json
-          FEEDS_FILE: feeds.txt
-      - name: Envoyer un unique message de contrôle au canal de test
-        if: ${{ inputs.send_test_message }}
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+          DRY_RUN: "0"
+          ALLOW_TELEGRAM_SEND: "1"
+          TELEGRAM_TOKEN: \${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: \${{ secrets.TELEGRAM_CHAT }}
+      - name: Sauvegarder l'état de la file d'attente
+        if: always()
         run: |
-          python - <<'PY'
-          import os
-          import requests
-
-          token = os.environ.get("TELEGRAM_TOKEN")
-          chat = os.environ.get("TELEGRAM_CHAT")
-          if not token or not chat:
-              raise SystemExit("Secrets Telegram absents : aucun message envoyé.")
-          response = requests.post(
-              f"https://api.telegram.org/bot{token}/sendMessage",
-              data={
-                  "chat_id": chat,
-                  "text": "🧪 Test technique news-telegram : connexion Telegram opérationnelle.",
-                  "disable_web_page_preview": "true",
-              },
-              timeout=20,
-          )
-          if not response.ok:
-              raise SystemExit(f"Échec Telegram HTTP {response.status_code}: {response.text[:300]}")
-          print("Message de contrôle unique envoyé au canal configuré.")
-          PY
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "Aucun changement d'état à enregistrer."
+            exit 0
+          fi
+          git commit -m "État du bot"
+          for attempt in 1 2 3 4 5; do
+            git pull --rebase origin main && git push && exit 0
+            sleep 5
+          done
+          echo "Impossible de sauvegarder state.json après 5 tentatives."
+          exit 1
