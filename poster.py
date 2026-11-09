@@ -15,6 +15,7 @@ DELAI = 15
 DELAI_RAPIDE = 15
 SEUIL_RAPIDE = 8
 MAX_PAR_RUN = 50
+MAX_ERREURS = 500
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 GDATA = re.compile(r"https?://gdata\.youtube\.com/feeds/base/users/([^/]+)/uploads")
 MOTIFS = [
@@ -32,7 +33,11 @@ def load_feeds(path="feeds.txt"):
         ]
 
 
-def load_state(path="state.json"):
+class PermanentTelegramError(Exception):
+    """Erreur Telegram définitive : l’article ne pourra pas être envoyé tel quel."""
+
+
+def load_state(path="state.json"): 
     try:
         with open(path, encoding="utf-8") as source:
             state = json.load(source)
@@ -43,11 +48,13 @@ def load_state(path="state.json"):
         raise ValueError("state.json doit contenir un objet JSON")
     state.setdefault("vus", [])
     state.setdefault("file", [])
+    state.setdefault("erreurs", [])
     state.setdefault("feeds", [])
     state.setdefault("yt", {})
     state.setdefault("init", False)
-    if not isinstance(state["vus"], list) or not isinstance(state["file"], list):
-        raise ValueError("Format invalide dans state.json : listes 'vus' et 'file' requises")
+    if (not isinstance(state["vus"], list) or not isinstance(state["file"], list)
+            or not isinstance(state["erreurs"], list)):
+        raise ValueError("Format invalide dans state.json : listes 'vus', 'file' et 'erreurs' requises")
     if not isinstance(state["feeds"], list) or not isinstance(state["yt"], dict):
         raise ValueError("Format invalide dans state.json : 'feeds' ou 'yt'")
 
@@ -62,6 +69,7 @@ def save_state(state, seen, path="state.json"):
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     state["vus"] = list(seen)[-5000:]
+    state["erreurs"] = state.get("erreurs", [])[-MAX_ERREURS:]
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -204,7 +212,10 @@ def send_message(item, token, chat_id, http=requests, sleep=time.sleep):
                 sleep(min(max(wait, 1), 60))
             continue
 
+        message = f"HTTP {response.status_code}: {response.text[:500]}"
         print("Erreur Telegram HTTP", response.status_code, response.text[:500])
+        if 400 <= response.status_code < 500:
+            raise PermanentTelegramError(message)
         return False
     return False
 
@@ -229,8 +240,20 @@ def process_queue(
         if sent:
             sleep(fast_delay if len(state["file"]) > fast_threshold else delay)
         item = state["file"][0]
-        if not sender(item, token, chat_id):
-            # Conserver le premier article : il sera réexaminé au prochain passage.
+        try:
+            delivered = sender(item, token, chat_id)
+        except PermanentTelegramError as exc:
+            # Une erreur 4xx (hors 429) ne sera pas corrigée par une nouvelle tentative.
+            # Isoler l’article défectueux pour ne pas bloquer toute la file.
+            state["erreurs"].append({
+                "item": item, "error": str(exc), "failed_at": int(clock()),
+            })
+            state["file"].pop(0)
+            save_state(state, seen, state_path)
+            print("ARTICLE MIS EN QUARANTAINE |", item.get("link", ""), "|", exc)
+            continue
+        if not delivered:
+            # Résultat ambigu ou erreur temporaire : conserver l’article en tête.
             break
         print("ENVOYÉ | publié:", item.get("pub") or "?", "|", item["link"])
         state["file"].pop(0)
