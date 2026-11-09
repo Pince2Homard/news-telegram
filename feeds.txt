@@ -35,28 +35,28 @@ https://www.youtube.com/feeds/videos.xml?channel_id=UCyamXi0qEQJghCjJbj__aWQ
 https://www.youtube.com/feeds/videos.xml?channel_id=UCSw8030bTEARWJid3pniuhw
 https://www.youtube.com/feeds/videos.xml?channel_id=UCGvjUWz3mGV9cssraATuEsw
 
-# --- YouTube (anciennes adresses, résolues automatiquement par le script) ---
-http://gdata.youtube.com/feeds/base/users/Ced_haurus/uploads
-http://gdata.youtube.com/feeds/base/users/cryptopourtous75/uploads
-http://gdata.youtube.com/feeds/base/users/ego_one/uploads
-http://gdata.youtube.com/feeds/base/users/FoodisLove/uploads
-http://gdata.youtube.com/feeds/base/users/LeZappingduCOVID/uploads
-http://gdata.youtube.com/feeds/base/users/MonsieuRabbit/uploads
-http://gdata.youtube.com/feeds/base/users/Objectif-Renta/uploads
-http://gdata.youtube.com/feeds/base/users/offinvestigation/uploads
-http://gdata.youtube.com/feeds/base/users/OPENBOXTVfr/uploads
-http://gdata.youtube.com/feeds/base/users/ouaicestmous/uploads
-http://gdata.youtube.com/feeds/base/users/Scanderia/uploads
-http://gdata.youtube.com/feeds/base/users/thefrenchitch/uploads
-http://gdata.youtube.com/feeds/base/users/Tocsin-media/uploads
-http://gdata.youtube.com/feeds/base/users/ZeAmericanDream/uploads
-http://gdata.youtube.com/feeds/base/users/Sandozprod/uploads
-http://gdata.youtube.com/feeds/base/users/raphfootball/uploads
-http://gdata.youtube.com/feeds/base/users/btlv-contact/uploads
-http://gdata.youtube.com/feeds/base/users/CryptoFoufi/uploads
-http://gdata.youtube.com/feeds/base/users/JulienRoman/uploads
-http://gdata.youtube.com/feeds/base/users/KasperTrading/uploads
-http://gdata.youtube.com/feeds/base/users/moneyradarcrypto/uploads
+# --- YouTube (adresses directes) ---
+https://www.youtube.com/feeds/videos.xml?channel_id=UCKwcQmaaXcdNf6uYrtygJeA
+https://www.youtube.com/feeds/videos.xml?channel_id=UC5bThRPUlQ51V3RhSYZ8vBw
+https://www.youtube.com/feeds/videos.xml?channel_id=UCxH16958KSxT4Z9yL_9JYtw
+https://www.youtube.com/feeds/videos.xml?channel_id=UCE-NIVMcV8A2GwGcCYLSMDQ
+https://www.youtube.com/feeds/videos.xml?channel_id=UC7vBQ7qT7sFCHwzwTWeoXBg
+https://www.youtube.com/feeds/videos.xml?channel_id=UCJMCgnfmU7acpC6zRhAeufg
+https://www.youtube.com/feeds/videos.xml?channel_id=UCybpp_oRvs3y4zrO5IU5ovA
+https://www.youtube.com/feeds/videos.xml?channel_id=UCEFGCs68E9Vr5te5qZuJsbg
+https://www.youtube.com/feeds/videos.xml?channel_id=UCGMfMTt87K1BIeUMOZUr7gw
+# A RETROUVER : ouaicestmous
+https://www.youtube.com/feeds/videos.xml?channel_id=UCtJuE2ar0ptD5b12ueCMq1w
+# A RETROUVER : thefrenchitch
+https://www.youtube.com/feeds/videos.xml?channel_id=UCLuLxfwPrxe4wUPkdYM_VDA
+https://www.youtube.com/feeds/videos.xml?channel_id=UCdlHcnOr_fP8nGKRK72lhaQ
+https://www.youtube.com/feeds/videos.xml?channel_id=UCnC8KCcp2-DYfPY4_bKIc0A
+https://www.youtube.com/feeds/videos.xml?channel_id=UCdHMLS_66WQO7AvKjp6J4cA
+https://www.youtube.com/feeds/videos.xml?channel_id=UC3FUHIUhkXVRS8PQgheGz4A
+https://www.youtube.com/feeds/videos.xml?channel_id=UCfCMwYqt_OEBvOT4cKq42LQ
+https://www.youtube.com/feeds/videos.xml?channel_id=UCPI14dRhufU9ePXXM2tKzpw
+https://www.youtube.com/feeds/videos.xml?channel_id=UCfSLTZ2kqUbNQhtGJI1wWUw
+# A RETROUVER : moneyradarcrypto
 
 # --- Odysee ---
 https://odysee.com/$/rss/@AgoraTVNEWS:5
@@ -67,8 +67,9 @@ https://odysee.com/$/rss/@STRATPOL:d
 https://odysee.com/$/rss/@neonews_fr:5
 
 # --- Sites ---
-# --- Autres sites (ex RSS bot) ---
+https://frenchbreaches.com/blog/feed.xml
+
+# --- Ex RSS bot ---
 https://www.phoenixjp.info/rss/numeriques-1.xml
 https://www.phoenixjp.info/rss/professionnel.xml
 https://www.francebleu.fr/rss/provence/a-la-une.xml
-https://frenchbreaches.com/blog/feed.xml
