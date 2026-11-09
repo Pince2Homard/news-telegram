@@ -145,5 +145,38 @@ class PosterSafetyTests(unittest.TestCase):
             self.assertEqual(saved["file"], [second])
 
 
+    def test_send_message_marks_permanent_client_errors(self):
+        response = Mock(ok=False, status_code=400, text="chat not found")
+        transport = Mock()
+        transport.post.return_value = response
+        with self.assertRaises(poster.PermanentTelegramError):
+            poster.send_message(
+                {"text": "test"}, "fake-token", "fake-chat", http=transport,
+            )
+        transport.post.assert_called_once()
+
+    def test_permanent_error_is_quarantined_and_does_not_block_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            bad = {"text": "bad", "link": "https://example.org/bad", "pub": ""}
+            good = {"text": "good", "link": "https://example.org/good", "pub": ""}
+            state = {"vus": [], "file": [bad, good], "erreurs": [], "feeds": [], "yt": {}, "v": 2}
+            def sender(item, token, chat_id):
+                if item is bad:
+                    raise poster.PermanentTelegramError("HTTP 400: chat not found")
+                return True
+            sent = poster.process_queue(
+                state, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=sender, delay=0, max_per_run=5, clock=lambda: 123,
+            )
+            self.assertEqual(sent, 1)
+            self.assertEqual(state["file"], [])
+            self.assertEqual(len(state["erreurs"]), 1)
+            self.assertEqual(state["erreurs"][0]["item"], bad)
+            self.assertEqual(state["erreurs"][0]["failed_at"], 123)
+            saved = json.loads(Path(path).read_text())
+            self.assertEqual(saved["erreurs"], state["erreurs"])
+
+
 if __name__ == "__main__":
     unittest.main()
