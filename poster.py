@@ -51,9 +51,8 @@ def load_state(path="state.json"):
     if not isinstance(state["feeds"], list) or not isinstance(state["yt"], dict):
         raise ValueError("Format invalide dans state.json : 'feeds' ou 'yt'")
 
+    # Migration non destructive : ne jamais effacer la file d'attente existante.
     if state.get("v") != 2:
-        state["feeds"] = []
-        state["file"] = []
         state["v"] = 2
     return state
 
@@ -74,6 +73,15 @@ def save_state(state, seen, path="state.json"):
             temp.flush()
             os.fsync(temp.fileno())
         os.replace(temp_path, target)
+        # Synchroniser le répertoire améliore la durabilité du remplacement atomique.
+        try:
+            directory_fd = os.open(str(target.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
     finally:
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
@@ -150,13 +158,21 @@ def collect_articles(feeds, state, http=requests, parser=feedparser.parse):
 
         for entry in reversed(entries):
             uid = entry.get("id") or entry.get("link")
-            if not uid or uid in seen:
+            if not uid:
                 continue
+            uid = str(uid)
+            if uid in seen:
+                continue
+
+            # Ne marquer comme vu qu'un article dont le lien est publiable.
+            item = format_item(entry)
+            if item is None:
+                print("Article ignoré : lien HTTP(S) absent ou invalide :", uid)
+                continue
+
             seen[uid] = None
             if not silent:
-                item = format_item(entry)
-                if item:
-                    state["file"].append(item)
+                state["file"].append(item)
 
     state["init"] = True
     return seen
@@ -171,10 +187,10 @@ def send_message(item, token, chat_id, http=requests, sleep=time.sleep):
                 timeout=30,
             )
         except requests.RequestException as exc:
-            print("Erreur réseau Telegram :", exc)
-            if attempt < 2:
-                sleep(5)
-            continue
+            # Résultat ambigu : Telegram a peut-être reçu le message.
+            # Ne pas réessayer automatiquement pour éviter un doublon.
+            print("Résultat d'envoi Telegram incertain, aucun nouvel essai :", exc)
+            return False
 
         if response.ok:
             return True
@@ -205,6 +221,7 @@ def process_queue(
             print("SIMULATION |", item.get("pub") or "?", "|", item.get("link", ""))
         return 0
 
+    # La file et les identifiants sont persistés avant toute tentative d'envoi.
     save_state(state, seen, state_path)
     started = clock()
     sent = 0
@@ -213,6 +230,7 @@ def process_queue(
             sleep(fast_delay if len(state["file"]) > fast_threshold else delay)
         item = state["file"][0]
         if not sender(item, token, chat_id):
+            # Conserver le premier article : il sera réexaminé au prochain passage.
             break
         print("ENVOYÉ | publié:", item.get("pub") or "?", "|", item["link"])
         state["file"].pop(0)
