@@ -164,7 +164,17 @@ def entries_for_feed(url, state, http=requests, parser=feedparser.parse):
 
 def collect_articles(feeds, state, http=requests, parser=feedparser.parse):
     seen = dict.fromkeys(state["vus"])
-    for url in feeds:
+    # Rotation persistante : chaque exécution commence au flux suivant.
+    # Elle évite que les derniers flux soient toujours pénalisés si la file sature.
+    if feeds:
+        offset = int(state.get("feed_offset", 0)) % len(feeds)
+        ordered_feeds = feeds[offset:] + feeds[:offset]
+        state["feed_offset"] = (offset + 1) % len(feeds)
+    else:
+        ordered_feeds = []
+        state["feed_offset"] = 0
+    deferred = 0
+    for url in ordered_feeds:
         try:
             entries = entries_for_feed(url, state, http=http, parser=parser)
         except Exception as exc:
@@ -192,13 +202,15 @@ def collect_articles(feeds, state, http=requests, parser=feedparser.parse):
             # Ne pas faire croître la file sans limite : un article non ajouté
             # n'est pas marqué comme vu et sera réessayé au passage suivant.
             if not silent and len(state["file"]) >= MAX_FILE:
-                print("File pleine : article différé :", item["link"])
+                deferred += 1
                 continue
 
             seen[uid] = None
             if not silent:
                 state["file"].append(item)
 
+    if deferred:
+        print(f"{deferred} article(s) différé(s) : file pleine ({MAX_FILE} maximum).")
     state["init"] = True
     return seen
 
