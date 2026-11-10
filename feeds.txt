@@ -35,7 +35,6 @@ https://www.youtube.com/feeds/videos.xml?channel_id=UCyamXi0qEQJghCjJbj__aWQ
 https://www.youtube.com/feeds/videos.xml?channel_id=UCSw8030bTEARWJid3pniuhw
 https://www.youtube.com/feeds/videos.xml?channel_id=UCGvjUWz3mGV9cssraATuEsw
 
-# --- YouTube (adresses directes) ---
 https://www.youtube.com/feeds/videos.xml?channel_id=UCKwcQmaaXcdNf6uYrtygJeA
 https://www.youtube.com/feeds/videos.xml?channel_id=UC5bThRPUlQ51V3RhSYZ8vBw
 https://www.youtube.com/feeds/videos.xml?channel_id=UCxH16958KSxT4Z9yL_9JYtw
