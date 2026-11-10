@@ -16,6 +16,7 @@ DELAI_RAPIDE = 15
 SEUIL_RAPIDE = 8
 MAX_PAR_RUN = 50
 MAX_ERREURS = 500
+MAX_FILE = 1000
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 GDATA = re.compile(r"https?://gdata\.youtube\.com/feeds/base/users/([^/]+)/uploads")
 MOTIFS = [
@@ -186,6 +187,12 @@ def collect_articles(feeds, state, http=requests, parser=feedparser.parse):
             item = format_item(entry)
             if item is None:
                 print("Article ignoré : lien HTTP(S) absent ou invalide :", uid)
+                continue
+
+            # Ne pas faire croître la file sans limite : un article non ajouté
+            # n'est pas marqué comme vu et sera réessayé au passage suivant.
+            if not silent and len(state["file"]) >= MAX_FILE:
+                print("File pleine : article différé :", item["link"])
                 continue
 
             seen[uid] = None
