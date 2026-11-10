@@ -86,7 +86,14 @@ class PosterSafetyTests(unittest.TestCase):
             {"id": "good-article", "title": "Valide", "link": "https://example.org/article"},
         ]))
         state = {"vus": [], "file": [], "feeds": [feed], "yt": {}}
-        seen = poster.collect_articles([feed], state, parser=parser)
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.return_value = response
+        seen = poster.collect_articles([feed], state, http=transport, parser=parser)
+        transport.get.assert_called_once_with(
+            feed, headers={"User-Agent": poster.UA}, timeout=(5, 20),
+        )
         self.assertNotIn("bad-article", seen)
         self.assertIn("good-article", seen)
         self.assertEqual(len(state["file"]), 1)
@@ -143,6 +150,65 @@ class PosterSafetyTests(unittest.TestCase):
             self.assertEqual(state["file"], [second])
             saved = json.loads(Path(path).read_text())
             self.assertEqual(saved["file"], [second])
+
+
+    def test_send_message_marks_permanent_client_errors(self):
+        response = Mock(ok=False, status_code=400, text="chat not found")
+        transport = Mock()
+        transport.post.return_value = response
+        with self.assertRaises(poster.PermanentTelegramError):
+            poster.send_message(
+                {"text": "test"}, "fake-token", "fake-chat", http=transport,
+            )
+        transport.post.assert_called_once()
+
+    def test_permanent_error_is_quarantined_and_does_not_block_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            bad = {"text": "bad", "link": "https://example.org/bad", "pub": ""}
+            good = {"text": "good", "link": "https://example.org/good", "pub": ""}
+            state = {"vus": [], "file": [bad, good], "erreurs": [], "feeds": [], "yt": {}, "v": 2}
+            def sender(item, token, chat_id):
+                if item is bad:
+                    raise poster.PermanentTelegramError("HTTP 400: chat not found")
+                return True
+            sent = poster.process_queue(
+                state, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=sender, delay=0, max_per_run=5, clock=lambda: 123,
+            )
+            self.assertEqual(sent, 1)
+            self.assertEqual(state["file"], [])
+            self.assertEqual(len(state["erreurs"]), 1)
+            self.assertEqual(state["erreurs"][0]["item"], bad)
+            self.assertEqual(state["erreurs"][0]["failed_at"], 123)
+            saved = json.loads(Path(path).read_text())
+            self.assertEqual(saved["erreurs"], state["erreurs"])
+
+
+    def test_parse_feed_uses_bounded_http_timeout(self):
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.return_value = response
+        parser = Mock(return_value=Mock(entries=[{"id": "one"}]))
+        parsed = poster.parse_feed(
+            "https://example.org/feed", http=transport, parser=parser,
+        )
+        self.assertEqual(parsed.entries, [{"id": "one"}])
+        transport.get.assert_called_once_with(
+            "https://example.org/feed",
+            headers={"User-Agent": poster.UA},
+            timeout=(5, 20),
+        )
+        parser.assert_called_once_with(b"<rss/>")
+
+    def test_parse_feed_raises_on_http_error(self):
+        response = Mock()
+        response.raise_for_status.side_effect = requests.HTTPError("503")
+        transport = Mock()
+        transport.get.return_value = response
+        with self.assertRaises(requests.HTTPError):
+            poster.parse_feed("https://example.org/feed", http=transport)
 
 
 if __name__ == "__main__":
