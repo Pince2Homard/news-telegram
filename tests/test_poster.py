@@ -299,5 +299,55 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertTrue(all("2 article(s) différé(s)" in call.args[0] for call in summaries))
 
 
+    def test_global_telegram_errors_preserve_entire_queue(self):
+        for status in (401, 403):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                path = str(Path(directory) / "state.json")
+                items = [
+                    {"text": "one", "link": "https://example.org/1", "pub": ""},
+                    {"text": "two", "link": "https://example.org/2", "pub": ""},
+                ]
+                state = {"vus": [], "file": items.copy(), "erreurs": [], "feeds": [], "yt": {}, "v": 2}
+                response = Mock(ok=False, status_code=status, text="global Telegram error")
+                transport = Mock()
+                transport.post.return_value = response
+                def sender(item, token, chat):
+                    return poster.send_message(item, token, chat, http=transport)
+                sent = poster.process_queue(
+                    state, {}, "token", "chat", state_path=path, dry_run=False,
+                    sender=sender, delay=0,
+                )
+                self.assertEqual(sent, 0)
+                self.assertEqual(state["file"], items)
+                self.assertEqual(state["erreurs"], [])
+                saved = json.loads(Path(path).read_text())
+                self.assertEqual(saved["file"], items)
+                self.assertEqual(saved["erreurs"], [])
+
+    def test_feed_offset_is_persisted_between_real_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            feeds = ["https://example.org/a", "https://example.org/b"]
+            state = {
+                "vus": [], "file": [], "feeds": feeds.copy(), "yt": {},
+                "erreurs": [], "v": 2, "feed_offset": 0,
+            }
+            response = Mock(content=b"<rss/>")
+            response.raise_for_status.return_value = None
+            transport = Mock()
+            transport.get.return_value = response
+            parser = Mock(return_value=Mock(entries=[]))
+
+            for expected_offset in (1, 0, 1):
+                seen = poster.collect_articles(feeds, state, http=transport, parser=parser)
+                poster.process_queue(
+                    state, seen, "token", "chat", state_path=path, dry_run=False,
+                    sender=Mock(return_value=False), delay=0,
+                )
+                saved = json.loads(Path(path).read_text())
+                self.assertEqual(saved["feed_offset"], expected_offset)
+                state = poster.load_state(path)
+
+
 if __name__ == "__main__":
     unittest.main()
