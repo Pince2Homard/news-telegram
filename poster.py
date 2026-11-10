@@ -35,7 +35,11 @@ def load_feeds(path="feeds.txt"):
 
 
 class PermanentTelegramError(Exception):
-    """Erreur Telegram définitive : l’article ne pourra pas être envoyé tel quel."""
+    """Erreur Telegram propre à un article : l’article ne pourra pas être envoyé tel quel."""
+
+
+class GlobalTelegramError(Exception):
+    """Erreur de configuration ou d’accès Telegram : toute la file doit être préservée."""
 
 
 def load_state(path="state.json"): 
@@ -243,6 +247,8 @@ def send_message(item, token, chat_id, http=requests, sleep=time.sleep):
 
         message = f"HTTP {response.status_code}: {response.text[:500]}"
         print("Erreur Telegram HTTP", response.status_code, response.text[:500])
+        if response.status_code in (401, 403):
+            raise GlobalTelegramError(message)
         if 400 <= response.status_code < 500:
             raise PermanentTelegramError(message)
         return False
@@ -271,8 +277,13 @@ def process_queue(
         item = state["file"][0]
         try:
             delivered = sender(item, token, chat_id)
+        except GlobalTelegramError as exc:
+            # Erreur globale d'identifiants/droits : ne jamais mettre les articles
+            # en quarantaine. On arrête et conserve la file pour correction.
+            print("ARRÊT DE SÉCURITÉ Telegram | file préservée |", exc)
+            break
         except PermanentTelegramError as exc:
-            # Une erreur 4xx (hors 429) ne sera pas corrigée par une nouvelle tentative.
+            # Une erreur propre à l'article ne sera pas corrigée par une nouvelle tentative.
             # Isoler l’article défectueux pour ne pas bloquer toute la file.
             state["erreurs"].append({
                 "item": item, "error": str(exc), "failed_at": int(clock()),
