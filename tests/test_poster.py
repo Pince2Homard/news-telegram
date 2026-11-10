@@ -86,7 +86,14 @@ class PosterSafetyTests(unittest.TestCase):
             {"id": "good-article", "title": "Valide", "link": "https://example.org/article"},
         ]))
         state = {"vus": [], "file": [], "feeds": [feed], "yt": {}}
-        seen = poster.collect_articles([feed], state, parser=parser)
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.return_value = response
+        seen = poster.collect_articles([feed], state, http=transport, parser=parser)
+        transport.get.assert_called_once_with(
+            feed, headers={"User-Agent": poster.UA}, timeout=(5, 20),
+        )
         self.assertNotIn("bad-article", seen)
         self.assertIn("good-article", seen)
         self.assertEqual(len(state["file"]), 1)
@@ -176,6 +183,32 @@ class PosterSafetyTests(unittest.TestCase):
             self.assertEqual(state["erreurs"][0]["failed_at"], 123)
             saved = json.loads(Path(path).read_text())
             self.assertEqual(saved["erreurs"], state["erreurs"])
+
+
+    def test_parse_feed_uses_bounded_http_timeout(self):
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.return_value = response
+        parser = Mock(return_value=Mock(entries=[{"id": "one"}]))
+        parsed = poster.parse_feed(
+            "https://example.org/feed", http=transport, parser=parser,
+        )
+        self.assertEqual(parsed.entries, [{"id": "one"}])
+        transport.get.assert_called_once_with(
+            "https://example.org/feed",
+            headers={"User-Agent": poster.UA},
+            timeout=(5, 20),
+        )
+        parser.assert_called_once_with(b"<rss/>")
+
+    def test_parse_feed_raises_on_http_error(self):
+        response = Mock()
+        response.raise_for_status.side_effect = requests.HTTPError("503")
+        transport = Mock()
+        transport.get.return_value = response
+        with self.assertRaises(requests.HTTPError):
+            poster.parse_feed("https://example.org/feed", http=transport)
 
 
 if __name__ == "__main__":
