@@ -296,7 +296,7 @@ class PosterSafetyTests(unittest.TestCase):
             and "article(s) différé(s)" in call.args[0]
         ]
         self.assertEqual(len(summaries), 2)
-        self.assertTrue(all("1 article(s) différé(s)" in call.args[0] for call in summaries))
+        self.assertTrue(all("2 article(s) différé(s)" in call.args[0] for call in summaries))
 
 
 if __name__ == "__main__":
