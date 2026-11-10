@@ -211,5 +211,62 @@ class PosterSafetyTests(unittest.TestCase):
             poster.parse_feed("https://example.org/feed", http=transport)
 
 
+    def test_queue_limit_defers_articles_without_marking_them_seen(self):
+        feed = "https://example.org/feed"
+        parser = Mock(return_value=Mock(entries=[
+            {"id": "new-article", "title": "Nouvel article", "link": "https://example.org/new"},
+        ]))
+        state = {
+            "vus": [], "file": [{"text": "existing", "link": "https://example.org/old"}] * poster.MAX_FILE,
+            "feeds": [feed], "yt": {},
+        }
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.return_value = response
+        seen = poster.collect_articles([feed], state, http=transport, parser=parser)
+        self.assertNotIn("new-article", seen)
+        self.assertEqual(len(state["file"]), poster.MAX_FILE)
+
+    def test_youtube_legacy_feed_uses_username_feed_when_available(self):
+        feed = "https://gdata.youtube.com/feeds/base/users/example/uploads"
+        entries = [{"id": "yt-one", "link": "https://youtube.com/watch?v=one"}]
+        response = Mock(content=b"<feed/>")
+        response.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.return_value = response
+        parser = Mock(return_value=Mock(entries=entries))
+        state = {"yt": {}}
+        result = poster.entries_for_feed(feed, state, http=transport, parser=parser)
+        self.assertEqual(result, entries)
+        transport.get.assert_called_once_with(
+            "https://www.youtube.com/feeds/videos.xml?user=example",
+            headers={"User-Agent": poster.UA}, timeout=(5, 20),
+        )
+        self.assertEqual(state["yt"], {})
+
+    def test_youtube_legacy_feed_resolves_channel_from_page_as_fallback(self):
+        feed = "https://gdata.youtube.com/feeds/base/users/example/uploads"
+        channel_id = "UC1234567890123456789012"
+        empty = Mock(content=b"<feed/>")
+        empty.raise_for_status.return_value = None
+        page = Mock(text='"externalId":"' + channel_id + '"')
+        page.raise_for_status.return_value = None
+        channel_feed = Mock(content=b"<feed/>")
+        channel_feed.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.side_effect = [empty, page, channel_feed]
+        entries = [{"id": "yt-two", "link": "https://youtube.com/watch?v=two"}]
+        parser = Mock(side_effect=[Mock(entries=[]), Mock(entries=entries)])
+        state = {"yt": {}}
+        result = poster.entries_for_feed(feed, state, http=transport, parser=parser)
+        self.assertEqual(result, entries)
+        self.assertEqual(state["yt"]["example"], channel_id)
+        self.assertEqual(transport.get.call_count, 3)
+        self.assertEqual(
+            transport.get.call_args_list[1].kwargs["timeout"], 30,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
