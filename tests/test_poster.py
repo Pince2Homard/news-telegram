@@ -268,5 +268,36 @@ class PosterSafetyTests(unittest.TestCase):
         )
 
 
+    def test_feed_order_rotates_between_runs_and_deferrals_are_summarized(self):
+        feeds = ["https://example.org/a", "https://example.org/b"]
+        state = {
+            "vus": [],
+            "file": [{"text": "existing", "link": "https://example.org/old"}],
+            "feeds": feeds.copy(), "yt": {}, "feed_offset": 0,
+        }
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        transport = Mock()
+        transport.get.return_value = response
+        parser = Mock(return_value=Mock(entries=[
+            {"id": "new", "title": "New", "link": "https://example.org/new"},
+        ]))
+        with patch.object(poster, "MAX_FILE", 1), patch("builtins.print") as log:
+            first_seen = poster.collect_articles(feeds, state, http=transport, parser=parser)
+            second_seen = poster.collect_articles(feeds, state, http=transport, parser=parser)
+        requested = [call.args[0] for call in transport.get.call_args_list]
+        self.assertEqual(requested, [feeds[0], feeds[1], feeds[1], feeds[0]])
+        self.assertNotIn("new", first_seen)
+        self.assertNotIn("new", second_seen)
+        self.assertEqual(state["feed_offset"], 0)
+        summaries = [
+            call for call in log.call_args_list
+            if call.args and isinstance(call.args[0], str)
+            and "article(s) différé(s)" in call.args[0]
+        ]
+        self.assertEqual(len(summaries), 2)
+        self.assertTrue(all("1 article(s) différé(s)" in call.args[0] for call in summaries))
+
+
 if __name__ == "__main__":
     unittest.main()
