@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - hardening/phase-1
+      - hardening/phase-2-operations
+      - hardening/phase-3-maintenance
   pull_request:
     branches:
       - main
