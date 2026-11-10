@@ -115,13 +115,23 @@ def format_item(entry):
     }
 
 
+def parse_feed(url, http=requests, parser=feedparser.parse, timeout=(5, 20)):
+    """Télécharge un flux avec délais de connexion et de lecture bornés."""
+    response = http.get(url, headers={"User-Agent": UA}, timeout=timeout)
+    response.raise_for_status()
+    return parser(response.content)
+
+
 def entries_for_feed(url, state, http=requests, parser=feedparser.parse):
     match = GDATA.match(url)
     if not match:
-        return parser(url, agent=UA).entries
+        return parse_feed(url, http=http, parser=parser).entries
 
     username = match.group(1)
-    data = parser("https://www.youtube.com/feeds/videos.xml?user=" + username, agent=UA)
+    data = parse_feed(
+        "https://www.youtube.com/feeds/videos.xml?user=" + username,
+        http=http, parser=parser,
+    )
     if data.entries:
         return data.entries
 
@@ -142,9 +152,9 @@ def entries_for_feed(url, state, http=requests, parser=feedparser.parse):
             print("Erreur résolution YouTube", username, exc)
 
     if username in state["yt"]:
-        data = parser(
+        data = parse_feed(
             "https://www.youtube.com/feeds/videos.xml?channel_id=" + state["yt"][username],
-            agent=UA,
+            http=http, parser=parser,
         )
         return data.entries
     print("Chaîne YouTube non résolue :", username)
