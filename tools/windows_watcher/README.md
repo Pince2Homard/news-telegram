@@ -49,6 +49,8 @@ Python doit afficher 3.12.x. Si `py` ne se lance pas, vérifier `py -0p` et `Get
 
 Dans **Paramètres > Système > Notifications et actions**, activer les notifications. Désactiver **Assistant de concentration** pour l'essai, garder la session ouverte et vérifier que la zone de notification Windows est disponible. Une stratégie de l'appareil peut masquer les bulles même si le programme retourne un code de succès.
 
+Le programme utilise WinForms `NotifyIcon.ShowBalloonTip` pour afficher une bulle dans la zone de notification. Windows peut ajuster sa durée selon les paramètres d'accessibilité et n'affiche qu'une bulle à la fois; les 10 secondes demandées par le code ne constituent donc pas une durée garantie. Voir la [documentation Microsoft de `ShowBalloonTip`](https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.notifyicon.showballoontip?view=windowsdesktop-10.0), les [paramètres de notifications Windows](https://support.microsoft.com/en-us/windows/experience/notifications-and-do-not-disturb-in-windows) et [Assistant de concentration](https://support.microsoft.com/en-us/windows/experience/focus-stay-on-task-without-distractions).
+
 ### 2. Vérifier la simulation sans effet système
 
 ```powershell
