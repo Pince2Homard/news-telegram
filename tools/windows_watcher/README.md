@@ -31,6 +31,76 @@ py -3.12 -m unittest discover -s tests -v
 
 Les tests emploient des réponses factices; ils n'effectuent aucun appel réseau, notification Windows ou planification.
 
+## Essai manuel Windows 10 sans installation permanente
+
+Cet essai se lance depuis une copie de travail du dépôt. Il n'installe rien dans le profil Windows et ne crée aucune tâche planifiée. Le test de notification est local et indépendant de GitHub; le relevé réel suivant ne fait que des requêtes GitHub `GET`.
+
+### 1. Vérifier la session Windows
+
+Ouvrir PowerShell dans une session utilisateur interactive et déverrouillée, depuis la racine du dépôt. Vérifier Python et PowerShell :
+
+```powershell
+py -3.12 --version
+Get-Command powershell.exe
+Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
+```
+
+Python doit afficher 3.12.x. Si `py` ne se lance pas, vérifier `py -0p` et `Get-Command python.exe`; n'utiliser qu'un exécutable dont `--version` confirme Python 3.12. Les alias WindowsApps ne sont pas une installation Python utilisable.
+
+Dans **Paramètres > Système > Notifications et actions**, activer les notifications. Désactiver **Assistant de concentration** pour l'essai, garder la session ouverte et vérifier que la zone de notification Windows est disponible. Une stratégie de l'appareil peut masquer les bulles même si le programme retourne un code de succès.
+
+### 2. Vérifier la simulation sans effet système
+
+```powershell
+py -3.12 tools\windows_watcher\watcher.py --simulate
+```
+
+Cette commande utilise une API factice et une notification factice. Elle ne contacte pas GitHub et ne doit pas afficher de notification Windows.
+
+### 3. Vérifier une notification Windows réelle
+
+```powershell
+py -3.12 -c "from tools.windows_watcher.watcher import show_windows_notification; print(show_windows_notification(1))"
+```
+
+Une bulle générique « 1 nouvel élément de coordination » doit apparaître près de la zone de notification. Cette commande n'appelle pas GitHub, n'écrit aucun état et n'envoie rien à Telegram. Le résultat `True` signifie que PowerShell s'est terminé sans erreur; il ne prouve pas que Windows a effectivement affiché la bulle. Confirmer visuellement l'affichage. Si elle manque, vérifier l'Assistant de concentration, les notifications Windows, la session déverrouillée et les stratégies locales avant de poursuivre.
+
+### 4. Tester le relevé GitHub avec un état temporaire
+
+Créer un dossier temporaire neuf pour isoler la configuration, les journaux et les curseurs :
+
+```powershell
+$testRoot = Join-Path $env:TEMP 'NewsTelegramWatcher-PR10'
+if (Test-Path -LiteralPath $testRoot) { throw "Le dossier existe déjà; choisissez un autre nom : $testRoot" }
+New-Item -ItemType Directory -Path $testRoot | Out-Null
+Copy-Item .\tools\windows_watcher\config.example.json (Join-Path $testRoot 'config.json')
+```
+
+Effectuer un relevé unique :
+
+```powershell
+py -3.12 tools\windows_watcher\watcher.py --once --config (Join-Path $testRoot 'config.json')
+```
+
+Il effectue un baseline silencieux et des requêtes HTTPS `GET` sur le dépôt public. L'état et les journaux restent sous `$testRoot`; aucun jeton ni droit d'écriture GitHub n'est utilisé. Ce premier relevé ne devrait pas notifier les anciens commentaires.
+
+Sans publier de commentaire de test, relancer manuellement la même commande après l'apparition naturelle d'un nouveau rapport/décision/revue portant un préfixe reconnu. Un nouvel événement doit produire la notification générique. Un commentaire modifié peut aussi être détecté si le fil est actualisé. Sans tâche planifiée, rien ne s'exécute entre deux lancements manuels. Une erreur réseau ou une réponse 403/429 doit laisser les curseurs inchangés; ne pas enchaîner les relances en cas de limitation.
+
+Pour examiner l'historique local et le journal sans afficher le corps des commentaires :
+
+```powershell
+py -3.12 tools\windows_watcher\watcher.py --history --config (Join-Path $testRoot 'config.json')
+Get-Content (Join-Path $testRoot 'watcher.log') -Tail 30
+```
+
+Après vérification, supprimer uniquement le dossier temporaire créé pour cet essai, si son contenu n'est plus nécessaire :
+
+```powershell
+Remove-Item -LiteralPath $testRoot -Recurse -Confirm
+```
+
+Ne pas créer de tâche dans le Planificateur Windows durant cette validation. L'essai du ballon est réel, mais le test de bout en bout dépend d'un nouvel événement GitHub réel apparaissant après le baseline.
+
 ## Installation manuelle (aucune tâche planifiée)
 
 Ces étapes ne sont pas exécutées par Codex. Les faire seulement après validation du propriétaire :
