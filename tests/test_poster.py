@@ -295,17 +295,52 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertEqual(state["file"], [])
         self.assertIn("far-future", seen)
 
-    def test_identical_canonical_url_with_distinct_guids_is_deduplicated_across_feeds(self):
+    def test_unknown_date_corrected_to_stale_is_expired_without_publication(self):
+        original = {
+            "id": "corrected-old", "title": "Unknown",
+            "link": "https://example.org/corrected-old",
+        }
+        state, _, _ = self.collect_entries([original])
+        corrected = {
+            **original,
+            "published_parsed": time.gmtime(TEST_RSS_NOW - 30 * 3600),
+        }
+        state, seen, _ = self.collect_entries(
+            [corrected], state=state, now=TEST_RSS_NOW + 3600,
+        )
+        self.assertEqual(state["date_quarantine"], [])
+        self.assertEqual(state["file"], [])
+        self.assertIn("corrected-old", seen)
+
+    def test_future_quarantine_rechecks_corrected_stale_publication_date(self):
+        future = {
+            "id": "corrected-future", "title": "Future",
+            "link": "https://example.org/corrected-future",
+            "published_parsed": time.gmtime(TEST_RSS_NOW + 10 * 60),
+        }
+        state, _, _ = self.collect_entries([future])
+        corrected = {
+            **future,
+            "published_parsed": time.gmtime(TEST_RSS_NOW - 30 * 3600),
+        }
+        state, seen, _ = self.collect_entries(
+            [corrected], state=state, now=TEST_RSS_NOW + 20 * 60,
+        )
+        self.assertEqual(state["date_quarantine"], [])
+        self.assertEqual(state["file"], [])
+        self.assertIn("corrected-future", seen)
+
+    def test_canonical_url_deduplicates_syntax_variants_but_keeps_query_intact(self):
         feeds = ["https://example.org/a", "https://example.net/b"]
         entries = {
             feeds[0]: [{
                 "id": "guid-a", "title": "A",
-                "link": "https://News.Example.com:443/story?id=7&utm_source=rss#top",
+                "link": "https://News.Example.com:443/story?id=7&edition=weekly#top",
                 "published_parsed": time.gmtime(TEST_RSS_NOW),
             }],
             feeds[1]: [{
                 "id": "guid-b", "title": "B",
-                "link": "https://news.example.com/story?utm_source=web&id=7",
+                "link": "https://news.example.com/story?id=7&edition=weekly",
                 "published_parsed": time.gmtime(TEST_RSS_NOW),
             }],
         }
@@ -324,6 +359,52 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertEqual(len(state["file"]), 1)
         self.assertEqual(len(state["url_seen"]), 1)
         self.assertEqual(len(state["url_seen"][0]), 32)
+
+    def test_tracking_and_unknown_query_parameters_are_not_discarded(self):
+        base = "https://example.org/story?id=7"
+        self.assertNotEqual(
+            poster._canonical_url_fingerprint(base + "&utm_source=rss"),
+            poster._canonical_url_fingerprint(base + "&utm_source=web"),
+        )
+        self.assertNotEqual(
+            poster._canonical_url_fingerprint(base + "&edition=morning"),
+            poster._canonical_url_fingerprint(base + "&edition=evening"),
+        )
+
+    def test_url_shaped_legacy_guid_does_not_hide_a_distinct_article(self):
+        feed = "https://example.org/feed"
+        legacy_guid = "https://example.org/legacy-guid/item"
+        entry = {
+            "id": "a-different-stable-guid", "title": "Different article",
+            "link": legacy_guid,
+            "published_parsed": time.gmtime(TEST_RSS_NOW),
+        }
+        state = {
+            "vus": [legacy_guid], "file": [], "feeds": [feed], "yt": {},
+            "init": True,
+        }
+        state, _, _ = self.collect_entries([entry], state=state)
+        self.assertEqual(len(state["file"]), 1)
+        self.assertEqual(state["file"][0]["link"], legacy_guid)
+
+    def test_url_index_survives_save_restart_without_rebuilding_from_legacy_guids(self):
+        protected_hash = "f" * 32
+        state = {
+            "v": 2, "vus": [f"https://guid.example/{index}" for index in range(5000)],
+            "file": [], "feeds": [], "yt": {},
+            "url_seen": [f"{index:032x}" for index in range(4999)] + [protected_hash],
+            "init": True,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            poster.save_state(state, state["vus"], str(path))
+            resumed = poster.load_state(str(path))
+            _COLLECT_ARTICLES_RAW(
+                [], resumed, queue_clock=lambda: TEST_RSS_NOW,
+                max_age_seconds=24 * 3600,
+            )
+        self.assertIn(protected_hash, resumed["url_seen"])
+        self.assertEqual(len(resumed["url_seen"]), poster.MAX_URL_SEEN)
 
     def test_reordered_feed_still_discovers_a_fresh_entry_before_its_cursor(self):
         feed = "https://example.org/feed"
@@ -401,6 +482,79 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertNotIn("quarantine-overflow", seen)
         self.assertEqual(state["feed_health"][feed]["latest_uid"], "prior")
         self.assertEqual(len(state["date_quarantine"]), 1)
+
+    def test_expired_unknown_date_frees_quarantine_space_before_feed_scan(self):
+        feed = "https://example.org/feed"
+        expired = {
+            "uid": "expired-unknown", "url_hash": "c" * 32,
+            "item": {"text": "expired", "link": "https://example.org/expired"},
+            "first_seen_at": TEST_RSS_NOW - 24 * 3600,
+            "reason": "unknown_date",
+        }
+        candidate = {
+            "id": "new-unknown", "title": "New unknown",
+            "link": "https://example.org/new-unknown",
+        }
+        state = {
+            "vus": [], "file": [], "feeds": [feed], "yt": {}, "init": True,
+            "date_quarantine": [expired],
+        }
+        with patch.object(poster, "MAX_DATE_QUARANTINE", 1):
+            state, seen, _ = self.collect_entries([candidate], state=state)
+        self.assertEqual([record["uid"] for record in state["date_quarantine"]], ["new-unknown"])
+        self.assertIn("expired-unknown", seen)
+        self.assertNotIn("new-unknown", seen)
+
+    def test_future_candidate_waiting_for_capacity_is_not_rechecked_after_admission(self):
+        feed = "https://example.org/feed"
+        now = TEST_RSS_NOW
+        state = {
+            "vus": [], "file": [{"text": "older", "link": "https://example.org/older"}],
+            "feeds": [feed], "yt": {}, "init": True,
+            "date_quarantine": [{
+                "uid": "wait-for-capacity",
+                "url_hash": poster._canonical_url_fingerprint(
+                    "https://example.org/wait-for-capacity",
+                ),
+                "item": {
+                    "text": "Candidate", "link": "https://example.org/wait-for-capacity",
+                },
+                "first_seen_at": now - 600, "reason": "future_date",
+                "published_at": now,
+            }],
+        }
+        with patch.object(poster, "MAX_FILE", 1), patch.object(
+            poster, "MAX_ADMISSION_BUFFER", 0,
+        ):
+            state, _, _ = self.collect_entries([], state=state, now=now)
+            self.assertEqual(state["date_quarantine"][0]["reason"], "admission_deferred")
+            state["file"].clear()
+            state, seen, _ = self.collect_entries(
+                [], state=state, now=now + 48 * 3600,
+            )
+        self.assertEqual(state["date_quarantine"], [])
+        self.assertEqual(len(state["file"]), 1)
+        self.assertEqual(state["file"][0]["link"], "https://example.org/wait-for-capacity")
+        self.assertIn("wait-for-capacity", seen)
+
+    def test_process_queue_never_publishes_date_quarantine_items(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sender = Mock(side_effect=AssertionError("quarantaine must not publish"))
+            state = {
+                "vus": [], "file": [], "feeds": [], "yt": {},
+                "date_quarantine": [{
+                    "uid": "unknown", "item": {
+                        "text": "Unknown date", "link": "https://example.org/unknown",
+                    }, "first_seen_at": TEST_RSS_NOW, "reason": "unknown_date",
+                }],
+            }
+            result = poster.process_queue(
+                state, {}, "unused", "unused",
+                state_path=str(Path(directory) / "state.json"), dry_run=False,
+                sender=sender,
+            )
+        self.assertEqual(result, 0)
+        sender.assert_not_called()
 
     def test_admission_buffer_promotes_fifo_after_existing_file_items(self):
         feed = "https://example.org/feed"
@@ -582,10 +736,17 @@ class PosterSafetyTests(unittest.TestCase):
             _, peak_bytes = tracemalloc.get_traced_memory()
             tracemalloc.stop()
             serialized_bytes = path.stat().st_size
+            reloaded = poster.load_state(str(path))
         self.assertGreater(duration, 0)
         self.assertGreater(peak_bytes, 0)
         self.assertGreater(serialized_bytes, 0)
         self.assertLess(serialized_bytes, 4_000_000)
+        self.assertEqual(len(reloaded["file"]), 1000)
+        self.assertEqual(len(reloaded["admission_buffer"]), 1000)
+        self.assertEqual(len(reloaded["date_quarantine"]), 500)
+        self.assertEqual(len(reloaded["url_seen"]), 5000)
+        self.assertEqual(len(reloaded["metrics_history"]), 12)
+        self.assertEqual(len(reloaded["vus"]), 4755)
 
     def test_state_rejects_invalid_last_successful_send_timestamp(self):
         with tempfile.TemporaryDirectory() as directory:

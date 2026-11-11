@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import feedparser
 import requests
@@ -372,7 +372,7 @@ def _feed_label(url):
 
 
 def _canonical_url_fingerprint(value):
-    """Empreinte SHA-128 d’une URL canonique, sans conserver l’URL dans l’index."""
+    """Hash URL sans fragment; conserve chemin et requête pour éviter les collisions sémantiques."""
     try:
         parsed = urlsplit(str(value or "").strip())
         if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
@@ -384,13 +384,8 @@ def _canonical_url_fingerprint(value):
             or parsed.scheme.lower() == "https" and port == 443
         ):
             host = f"{host}:{port}"
-        query = [
-            (key, val) for key, val in parse_qsl(parsed.query, keep_blank_values=True)
-            if not key.lower().startswith("utm_")
-            and key.lower() not in {"fbclid", "gclid", "mc_cid", "mc_eid"}
-        ]
         canonical = urlunsplit((
-            parsed.scheme.lower(), host, parsed.path or "/", urlencode(query), "",
+            parsed.scheme.lower(), host, parsed.path or "/", parsed.query, "",
         ))
     except (TypeError, ValueError, UnicodeError):
         return None
@@ -697,13 +692,16 @@ def collect_articles(
     quarantine_initial = len(state["date_quarantine"])
     queue_max = queue_initial
     seen = dict.fromkeys(state["vus"])
-    # Reconstruire l'index borné depuis les enregistrements actifs après une
-    # reprise, sans modifier les anciens identifiants exacts de vus.
-    for uid in seen:
-        _remember_url(state, _canonical_url_fingerprint(uid))
+    # Un GUID peut ressembler à une URL sans être le lien de l'article. Ne pas
+    # fabriquer de correspondance URL à partir de l'ancien historique d'IDs.
+    url_seen = set(state["url_seen"])
+    active_url_seen = set()
     for item in state["file"]:
         if isinstance(item, dict):
-            _remember_url(state, _canonical_url_fingerprint(item.get("link")))
+            fingerprint = _canonical_url_fingerprint(item.get("link"))
+            _remember_url(state, fingerprint)
+            if fingerprint:
+                active_url_seen.add(fingerprint)
     for record in state["admission_buffer"] + state["date_quarantine"]:
         if record.get("uid"):
             seen[str(record["uid"])] = None
@@ -712,6 +710,8 @@ def collect_articles(
             fingerprint = _canonical_url_fingerprint(record["item"].get("link"))
             record["url_hash"] = fingerprint
         _remember_url(state, fingerprint)
+        if fingerprint:
+            active_url_seen.add(fingerprint)
 
     # Les états historiques sans init mais avec de l’activité sont déjà en service.
     was_initialized = (
@@ -746,21 +746,35 @@ def collect_articles(
         },
         "attempted": 0,
     }
-    url_seen = set(state["url_seen"])
     promoted = _drain_admission_buffer(state, now_epoch)
     queue_max = max(queue_max, len(state["file"]))
     if promoted:
         counts["buffer_promoted"] += promoted
         counts["added"] += promoted
 
-    # Les dates futures peuvent devenir admissibles même si le flux n'est plus
-    # disponible. Les dates inconnues, elles, restent réexaminables jusqu'au
-    # terme de leur quarantaine, après le parcours RSS de ce passage.
+    # Libérer avant le parcours RSS les dates inconnues arrivées à échéance,
+    # afin qu'elles ne bloquent pas inutilement une nouvelle entrée.
     quarantine = state["date_quarantine"]
+    expiration_now = float(queue_clock())
+    for record in list(quarantine):
+        if (record.get("reason") == "unknown_date"
+                and expiration_now >= _quarantine_deadline(record, max_age_seconds)):
+            quarantine.remove(record)
+            if record.get("uid"):
+                seen[str(record["uid"])] = None
+            _remember_url(state, record.get("url_hash"))
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            counts["freshness_rejected"] += 1
+            counts["quarantine_expired"] += 1
+
+    # Les articles déjà admis gardent leur éligibilité et sont réessayés avant
+    # de consulter de nouvelles dates RSS.
     for record in list(quarantine):
         reason = record.get("reason")
-        record_now = float(queue_clock())
         if reason == "admission_deferred":
+            record_now = float(queue_clock())
             target = _admit_item(
                 state, str(record.get("uid") or ""),
                 record.get("url_hash"), record.get("item") or {}, record_now,
@@ -774,69 +788,12 @@ def collect_articles(
                 counts["admitted"] += 1
                 if record.get("url_hash"):
                     url_seen.add(record["url_hash"])
+                    active_url_seen.add(record["url_hash"])
                 if target == "file":
                     counts["added"] += 1
                 else:
                     counts["buffered"] += 1
                 queue_max = max(queue_max, len(state["file"]))
-            continue
-        if reason != "future_date":
-            continue
-        published_at = record.get("published_at")
-        if (isinstance(published_at, bool)
-                or not isinstance(published_at, (int, float))
-                or not math.isfinite(published_at)):
-            continue
-        age = record_now - float(published_at)
-        first_seen = float(record.get("first_seen_at", now_epoch))
-        if (
-            float(published_at) - first_seen > MAX_FUTURE_DATE_DAYS * 86400
-            and record_now - first_seen >= UNKNOWN_DATE_QUARANTINE_SECONDS
-        ):
-            quarantine.remove(record)
-            if record.get("uid"):
-                seen[str(record["uid"])] = None
-            _remember_url(state, record.get("url_hash"))
-            if record.get("url_hash"):
-                url_seen.add(record["url_hash"])
-            counts["freshness_rejected"] += 1
-            counts["quarantine_expired"] += 1
-            continue
-        if age < -FUTURE_DATE_TOLERANCE_SECONDS:
-            continue
-        if age > max_age_seconds:
-            quarantine.remove(record)
-            if record.get("uid"):
-                seen[str(record["uid"])] = None
-            _remember_url(state, record.get("url_hash"))
-            if record.get("url_hash"):
-                url_seen.add(record["url_hash"])
-            counts["freshness_rejected"] += 1
-            counts["quarantine_expired"] += 1
-            continue
-        record["reason"] = "admission_deferred"
-        record["admitted_at"] = record_now
-        counts["admissible"] += 1
-        target = _admit_item(
-            state, str(record.get("uid") or ""),
-            record.get("url_hash"), record.get("item") or {}, record_now,
-            first_seen_at=record.get("first_seen_at", now_epoch),
-            admitted_at=record_now,
-        )
-        if target:
-            seen[str(record.get("uid") or "")] = None
-            quarantine.remove(record)
-            counts["quarantine_released"] += 1
-            counts["admitted"] += 1
-            if record.get("url_hash"):
-                url_seen.add(record["url_hash"])
-            if target == "file":
-                counts["added"] += 1
-            else:
-                counts["buffered"] += 1
-            queue_max = max(queue_max, len(state["file"]))
-        else:
-            counts["deferred"] += 1
 
     for index, url in enumerate(ordered_feeds):
         if clock() - started >= budget:
@@ -953,6 +910,7 @@ def collect_articles(
                         counts["admitted"] += 1
                         if fingerprint:
                             url_seen.add(fingerprint)
+                        active_url_seen.add(fingerprint)
                         if target == "file":
                             counts["added"] += 1
                         else:
@@ -983,7 +941,8 @@ def collect_articles(
                 if not blocked_cursor:
                     current_cursor = uid
                 continue
-            if fingerprint and fingerprint in url_seen:
+            if fingerprint and (
+                    fingerprint in url_seen or fingerprint in active_url_seen):
                 counts["duplicate_id"] += 1
                 seen[uid] = None
                 if not blocked_cursor:
@@ -996,6 +955,7 @@ def collect_articles(
                 _remember_url(state, fingerprint)
                 if fingerprint:
                     url_seen.add(fingerprint)
+                    active_url_seen.add(fingerprint)
                 if not blocked_cursor:
                     current_cursor = uid
                 continue
@@ -1052,6 +1012,8 @@ def collect_articles(
                 state["date_quarantine"].append(_make_quarantine_record(
                     uid, fingerprint, item, article_now, reason, published_at,
                 ))
+                if fingerprint:
+                    active_url_seen.add(fingerprint)
                 counts["quarantined"] += 1
                 if not blocked_cursor:
                     current_cursor = uid
@@ -1074,6 +1036,7 @@ def collect_articles(
             queue_max = max(queue_max, len(state["file"]))
             if fingerprint:
                 url_seen.add(fingerprint)
+                active_url_seen.add(fingerprint)
             if not blocked_cursor:
                 current_cursor = uid
 
@@ -1092,27 +1055,79 @@ def collect_articles(
         if checkpoint and (index + 1) % max(1, checkpoint_every) == 0:
             checkpoint(state, seen)
 
+    # Une date future doit être revalidée contre le flux disponible avant son
+    # admission : l'éditeur peut avoir corrigé la date depuis sa découverte.
+    # Si le flux est indisponible ou ne contient plus l'entrée, la date fiable
+    # mémorisée permet tout de même une reprise dès qu'elle devient admissible.
+    for record in list(quarantine):
+        if record.get("reason") != "future_date":
+            continue
+        record_now = float(queue_clock())
+        published_at = record.get("published_at")
+        if (isinstance(published_at, bool)
+                or not isinstance(published_at, (int, float))
+                or not math.isfinite(published_at)):
+            continue
+        age = record_now - float(published_at)
+        first_seen = float(record.get("first_seen_at", now_epoch))
+        if (
+            float(published_at) - first_seen > MAX_FUTURE_DATE_DAYS * 86400
+            and record_now - first_seen >= UNKNOWN_DATE_QUARANTINE_SECONDS
+        ):
+            quarantine.remove(record)
+            if record.get("uid"):
+                seen[str(record["uid"])] = None
+            _remember_url(state, record.get("url_hash"))
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            counts["freshness_rejected"] += 1
+            counts["quarantine_expired"] += 1
+            continue
+        if age < -FUTURE_DATE_TOLERANCE_SECONDS:
+            continue
+        if age > max_age_seconds:
+            quarantine.remove(record)
+            if record.get("uid"):
+                seen[str(record["uid"])] = None
+            _remember_url(state, record.get("url_hash"))
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            counts["freshness_rejected"] += 1
+            counts["quarantine_expired"] += 1
+            continue
+        record["reason"] = "admission_deferred"
+        record["admitted_at"] = record_now
+        counts["admissible"] += 1
+        target = _admit_item(
+            state, str(record.get("uid") or ""),
+            record.get("url_hash"), record.get("item") or {}, record_now,
+            first_seen_at=record.get("first_seen_at", now_epoch),
+            admitted_at=record_now,
+        )
+        if target:
+            seen[str(record.get("uid") or "")] = None
+            quarantine.remove(record)
+            counts["quarantine_released"] += 1
+            counts["admitted"] += 1
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            if target == "file":
+                counts["added"] += 1
+            else:
+                counts["buffered"] += 1
+            queue_max = max(queue_max, len(state["file"]))
+        else:
+            counts["deferred"] += 1
+
     completed = counts["attempted"] == len(ordered_feeds)
     if completed and feeds:
         # Après un cycle complet, décaler le début d’un flux pour l’équité.
         state["feed_offset"] = (offset + 1) % len(feeds)
     elif not feeds:
         state["feed_offset"] = 0
-    # Une date inconnue non corrigée expire après une fenêtre de fraîcheur
-    # complète. Elle n'a jamais été publiée sur la seule base de sa collecte.
-    expiration_now = float(queue_clock())
-    for record in list(state["date_quarantine"]):
-        if (record.get("reason") == "unknown_date"
-                and expiration_now >= _quarantine_deadline(record, max_age_seconds)):
-            state["date_quarantine"].remove(record)
-            if record.get("uid"):
-                seen[str(record["uid"])] = None
-            _remember_url(state, record.get("url_hash"))
-            if record.get("url_hash"):
-                url_seen.add(record["url_hash"])
-            counts["freshness_rejected"] += 1
-            counts["quarantine_expired"] += 1
-
     state["url_seen"] = list(dict.fromkeys(state["url_seen"]))[-MAX_URL_SEEN:]
     state["init"] = True
     recurrent = [
