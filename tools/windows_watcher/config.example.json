@@ -1,0 +1,8 @@
+{
+  "repository": "Pince2Homard/news-telegram",
+  "coordination_issue": 7,
+  "authorized_authors": [
+    "Pince2Homard"
+  ],
+  "poll_interval_minutes": 30
+}
