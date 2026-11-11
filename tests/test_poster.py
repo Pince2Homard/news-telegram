@@ -9,6 +9,20 @@ import requests
 import poster
 
 
+class FakeClock:
+    def __init__(self, value=0):
+        self.value = float(value)
+
+    def __call__(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.value += seconds
+
+    def advance(self, seconds):
+        self.value += seconds
+
+
 class PosterSafetyTests(unittest.TestCase):
     def test_main_is_dry_run_without_explicit_send_permission(self):
         with patch.dict(os.environ, {"DRY_RUN": "0"}, clear=True):
@@ -79,6 +93,27 @@ class PosterSafetyTests(unittest.TestCase):
             self.assertEqual(migrated["file"], pending)
             self.assertEqual(migrated["feeds"], ["feed"])
 
+    def test_state_rejects_invalid_last_successful_send_timestamp(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            path.write_text(json.dumps({
+                "vus": [], "file": [], "last_successful_send_at": "not-a-timestamp",
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "last_successful_send_at"):
+                poster.load_state(str(path))
+
+    def test_telegram_interval_is_configurable_and_defaults_to_30(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(poster.get_telegram_interval_seconds(), 30)
+        for interval in (30, 60, 90, 120):
+            with self.subTest(interval=interval):
+                self.assertEqual(poster.get_telegram_interval_seconds(str(interval)), interval)
+                with patch.dict(os.environ, {"TELEGRAM_INTERVAL_SECONDS": str(interval)}):
+                    self.assertEqual(poster.get_telegram_interval_seconds(), interval)
+        for invalid in ("0", "-1", "abc", "30.5"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                poster.get_telegram_interval_seconds(invalid)
+
     def test_legacy_active_state_without_init_does_not_silence_new_feed_latest(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
@@ -146,6 +181,32 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertEqual(transport.post.call_count, 2)
         sleeper.assert_called_once_with(2)
 
+    def test_send_message_logs_utc_duration_and_message_id_without_credentials(self):
+        response = Mock(ok=True, status_code=200)
+        response.json.return_value = {
+            "ok": True, "result": {"message_id": 987, "date": 1700000123},
+        }
+        transport = Mock()
+        transport.post.return_value = response
+        fake_clock = FakeClock(1700000124)
+        with patch("builtins.print") as log:
+            result = poster.send_message(
+                {"text": "test"}, "sensitive-token", "sensitive-chat",
+                http=transport, clock=fake_clock, monotonic=fake_clock,
+            )
+        self.assertTrue(result)
+        self.assertEqual(result.message_id, 987)
+        self.assertEqual(result.telegram_date, 1700000123)
+        output = " ".join(
+            " ".join(str(part) for part in call.args)
+            for call in log.call_args_list
+        )
+        self.assertIn("début_utc", output)
+        self.assertIn("durée_s", output)
+        self.assertIn("message_id", output)
+        self.assertNotIn("sensitive-token", output)
+        self.assertNotIn("sensitive-chat", output)
+
     def test_failed_send_keeps_item_in_queue(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.json")
@@ -167,14 +228,214 @@ class PosterSafetyTests(unittest.TestCase):
             second = {"text": "two", "link": "https://example.org/2", "pub": ""}
             state = {"vus": [], "file": [first, second], "feeds": [], "yt": {}, "v": 2}
             sender = Mock(side_effect=[True, False])
+            fake_clock = FakeClock(123)
             sent = poster.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
-                sender=sender, delay=0, max_per_run=5,
+                sender=sender, interval_seconds=1, sleep=fake_clock.sleep,
+                max_per_run=5, clock=fake_clock, monotonic=fake_clock,
             )
             self.assertEqual(sent, 1)
             self.assertEqual(state["file"], [second])
             saved = json.loads(Path(path).read_text())
             self.assertEqual(saved["file"], [second])
+
+    def test_successful_posts_obey_each_configured_interval(self):
+        for interval in (30, 60, 90, 120):
+            with self.subTest(interval=interval), tempfile.TemporaryDirectory() as directory:
+                path = str(Path(directory) / "state.json")
+                items = [
+                    {"text": str(index), "link": f"https://example.org/{index}", "pub": ""}
+                    for index in range(3)
+                ]
+                state = {"vus": [], "file": items.copy(), "feeds": [], "yt": {}, "v": 2}
+                fake_clock = FakeClock(1000)
+                send_times = []
+
+                def sender(item, token, chat_id):
+                    send_times.append(fake_clock())
+                    return True
+
+                sent = poster.process_queue(
+                    state, {}, "token", "chat", state_path=path, dry_run=False,
+                    sender=sender, interval_seconds=interval,
+                    sleep=fake_clock.sleep, clock=fake_clock, monotonic=fake_clock,
+                    time_limit=(2 * interval) + poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+                )
+                self.assertEqual(sent, 3)
+                self.assertEqual(
+                    [later - earlier for earlier, later in zip(send_times, send_times[1:])],
+                    [interval, interval],
+                )
+                saved = json.loads(Path(path).read_text(encoding="utf-8"))
+                self.assertEqual(saved["last_successful_send_at"], 1000 + (2 * interval))
+                self.assertEqual(saved["file"], [])
+
+    def test_default_cadence_allows_multiple_posts_within_workflow_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            items = [
+                {"text": str(index), "link": f"https://example.org/{index}", "pub": ""}
+                for index in range(10)
+            ]
+            state = {"vus": [], "file": items.copy(), "feeds": [], "yt": {}, "v": 2}
+            fake_clock = FakeClock(1000)
+            send_times = []
+
+            def sender(item, token, chat_id):
+                send_times.append(fake_clock())
+                return True
+
+            with patch.dict(os.environ, {}, clear=True):
+                sent = poster.process_queue(
+                    state, {}, "token", "chat", state_path=path, dry_run=False,
+                    sender=sender, sleep=fake_clock.sleep,
+                    clock=fake_clock, monotonic=fake_clock,
+                    time_limit=poster.RUN_BUDGET,
+                )
+
+            self.assertEqual(poster.get_telegram_interval_seconds(), 30)
+            self.assertEqual(sent, 10)
+            self.assertEqual(len(state["file"]), 0)
+            self.assertEqual(
+                [later - earlier for earlier, later in zip(send_times, send_times[1:])],
+                [30] * 9,
+            )
+            self.assertLessEqual(fake_clock() - 1000, poster.RUN_BUDGET)
+
+    def test_remaining_interval_is_enforced_across_workflow_executions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            items = [
+                {"text": "one", "link": "https://example.org/1", "pub": ""},
+                {"text": "two", "link": "https://example.org/2", "pub": ""},
+            ]
+            state = {"vus": [], "file": items.copy(), "feeds": [], "yt": {}, "v": 2}
+            fake_clock = FakeClock(500)
+            first = Mock(return_value=True)
+            poster.process_queue(
+                state, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=first, interval_seconds=60, max_per_run=1,
+                clock=fake_clock, monotonic=fake_clock,
+            )
+            persisted = poster.load_state(path)
+            self.assertEqual(persisted["last_successful_send_at"], 500)
+
+            fake_clock.advance(59)
+            second_send_times = []
+
+            def second_sender(item, token, chat_id):
+                second_send_times.append(fake_clock())
+                return True
+
+            sent = poster.process_queue(
+                persisted, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=second_sender, interval_seconds=60,
+                sleep=fake_clock.sleep, clock=fake_clock, monotonic=fake_clock,
+                time_limit=60 + poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+            )
+            self.assertEqual(sent, 1)
+            self.assertEqual(second_send_times, [560])
+            self.assertEqual(persisted["file"], [])
+
+    def test_interrupted_cadence_wait_resumes_from_persisted_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            item = {"text": "pending", "link": "https://example.org/1", "pub": ""}
+            state = {
+                "vus": [], "file": [item], "feeds": [], "yt": {}, "v": 2,
+                "last_successful_send_at": 100,
+            }
+            fake_clock = FakeClock(100)
+
+            def interrupt_wait(seconds):
+                raise RuntimeError("simulated workflow interruption")
+
+            with self.assertRaisesRegex(RuntimeError, "workflow interruption"):
+                poster.process_queue(
+                    state, {}, "token", "chat", state_path=path, dry_run=False,
+                    sender=Mock(return_value=True), interval_seconds=120,
+                    sleep=interrupt_wait, clock=fake_clock, monotonic=fake_clock,
+                    time_limit=400,
+                )
+
+            resumed = poster.load_state(path)
+            self.assertEqual(resumed["file"], [item])
+            self.assertEqual(resumed["last_successful_send_at"], 100)
+            fake_clock.advance(120)
+            sender = Mock(return_value=True)
+            sent = poster.process_queue(
+                resumed, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=sender, interval_seconds=120,
+                sleep=fake_clock.sleep, clock=fake_clock, monotonic=fake_clock,
+                time_limit=poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+            )
+            self.assertEqual(sent, 1)
+            sender.assert_called_once()
+            self.assertEqual(resumed["file"], [])
+
+    def test_queue_wait_is_skipped_when_next_send_cannot_fit_run_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            item = {"text": "pending", "link": "https://example.org/1", "pub": ""}
+            state = {
+                "vus": [], "file": [item], "feeds": [], "yt": {}, "v": 2,
+                "last_successful_send_at": 2000,
+            }
+            fake_clock = FakeClock(2000)
+            sender = Mock(return_value=True)
+            sent = poster.process_queue(
+                state, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=sender, interval_seconds=120, sleep=fake_clock.sleep,
+                clock=fake_clock, monotonic=fake_clock,
+                time_limit=120 + poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS - 1,
+            )
+            self.assertEqual(sent, 0)
+            sender.assert_not_called()
+            self.assertEqual(fake_clock(), 2000)
+            self.assertEqual(state["file"], [item])
+            saved = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(saved["file"], [item])
+
+    def test_long_configured_interval_does_not_block_workflow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            item = {"text": "pending", "link": "https://example.org/1", "pub": ""}
+            state = {
+                "vus": [], "file": [item], "feeds": [], "yt": {}, "v": 2,
+                "last_successful_send_at": 3000,
+            }
+            fake_clock = FakeClock(3000)
+            sender = Mock(return_value=True)
+            sent = poster.process_queue(
+                state, {}, "token", "chat", state_path=path, dry_run=False,
+                sender=sender, interval_seconds=600, sleep=fake_clock.sleep,
+                clock=fake_clock, monotonic=fake_clock,
+            )
+            self.assertEqual(sent, 0)
+            sender.assert_not_called()
+            self.assertEqual(fake_clock(), 3000)
+            self.assertEqual(state["file"], [item])
+
+    def test_confirmed_telegram_metadata_is_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "state.json")
+            item = {"text": "one", "link": "https://example.org/1", "pub": ""}
+            state = {"vus": [], "file": [item], "feeds": [], "yt": {}, "v": 2}
+            fake_clock = FakeClock(1700001000.25)
+            result = poster.TelegramSendResult(True, message_id=987, telegram_date=1700001000)
+            with patch("builtins.print") as log:
+                sent = poster.process_queue(
+                    state, {}, "token", "chat", state_path=path, dry_run=False,
+                    sender=Mock(return_value=result), interval_seconds=120,
+                    clock=fake_clock, monotonic=fake_clock,
+                )
+            self.assertEqual(sent, 1)
+            self.assertEqual(state["last_successful_send_at"], 1700001001)
+            self.assertEqual(state["last_successful_message_id"], 987)
+            saved = json.loads(Path(path).read_text(encoding="utf-8"))
+            self.assertEqual(saved["last_successful_send_at"], 1700001001)
+            self.assertEqual(saved["last_successful_message_id"], 987)
+            self.assertIn("prochaine_publication_utc", str(log.call_args_list))
 
 
     def test_send_message_marks_permanent_client_errors(self):
@@ -199,7 +460,7 @@ class PosterSafetyTests(unittest.TestCase):
                 return True
             sent = poster.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
-                sender=sender, delay=0, max_per_run=5, clock=lambda: 123,
+                sender=sender, max_per_run=5, clock=lambda: 123,
             )
             self.assertEqual(sent, 1)
             self.assertEqual(state["file"], [])
@@ -416,7 +677,7 @@ class PosterSafetyTests(unittest.TestCase):
                     return poster.send_message(item, token, chat, http=transport)
                 sent = poster.process_queue(
                     state, {}, "token", "chat", state_path=path, dry_run=False,
-                    sender=sender, delay=0,
+                    sender=sender,
                 )
                 self.assertEqual(sent, 0)
                 self.assertEqual(state["file"], items)
@@ -443,7 +704,7 @@ class PosterSafetyTests(unittest.TestCase):
                 seen = poster.collect_articles(feeds, state, http=transport, parser=parser)
                 poster.process_queue(
                     state, seen, "token", "chat", state_path=path, dry_run=False,
-                    sender=Mock(return_value=False), delay=0,
+                    sender=Mock(return_value=False),
                 )
                 saved = json.loads(Path(path).read_text())
                 self.assertEqual(saved["feed_offset"], expected_offset)
@@ -591,6 +852,33 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertNotIn("do-not-print", " ".join(str(c) for c in log.call_args_list))
         self.assertEqual(transport.get.call_count, 6)
 
+    def test_http_feed_errors_log_status_and_category_without_url(self):
+        feed = "https://example.org/rss?token=private-value"
+        response = Mock(headers={"Retry-After": "17"})
+        error = requests.HTTPError(
+            "HTTP 429 for https://example.org/rss?token=private-value",
+            response=Mock(status_code=429, headers={"Retry-After": "17"}),
+        )
+        response.raise_for_status.side_effect = error
+        transport = Mock()
+        transport.get.return_value = response
+        state = {"vus": [], "file": [], "feeds": [feed], "yt": {}, "init": True}
+
+        with patch("builtins.print") as log:
+            poster.collect_articles([feed], state, http=transport, parser=Mock())
+
+        output = " ".join(
+            " ".join(str(part) for part in call.args)
+            for call in log.call_args_list
+        )
+        self.assertIn("HTTP: 429", output)
+        self.assertIn("catégorie: rate_limited", output)
+        self.assertIn("retry_after_s: 17", output)
+        self.assertNotIn("private-value", output)
+        self.assertNotIn("/rss?", output)
+        self.assertEqual(state["feed_health"][feed]["last_http_status"], 429)
+        self.assertEqual(state["feed_health"][feed]["last_error_category"], "rate_limited")
+
     def test_send_accepted_before_state_save_is_retried_after_restart_at_least_once(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / "state.json")
@@ -606,18 +894,20 @@ class PosterSafetyTests(unittest.TestCase):
                 raise OSError("simulated crash before post-send checkpoint")
 
             accepted = Mock(return_value=True)
-            with patch.object(poster, "save_state", side_effect=fail_after_send):
+            with patch.object(poster, "save_state", side_effect=fail_after_send), \
+                 patch("builtins.print") as log:
                 with self.assertRaisesRegex(OSError, "simulated crash"):
                     poster.process_queue(
                         state, {}, "token", "chat", state_path=path, dry_run=False,
-                        sender=accepted, delay=0,
+                        sender=accepted,
                     )
+            self.assertIn("doublon_possible_après_reprise: oui", str(log.call_args_list))
             persisted = poster.load_state(path)
             self.assertEqual(persisted["file"], [item])
             sender_after_restart = Mock(return_value=True)
             poster.process_queue(
                 persisted, {}, "token", "chat", state_path=path, dry_run=False,
-                sender=sender_after_restart, delay=0,
+                sender=sender_after_restart,
             )
             accepted.assert_called_once()
             sender_after_restart.assert_called_once()
