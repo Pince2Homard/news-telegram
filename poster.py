@@ -1,6 +1,7 @@
 """Collecte de flux et diffusion Telegram, avec publication verrouillée par défaut."""
 import html
 import hashlib
+import calendar
 import json
 import math
 import os
@@ -9,8 +10,9 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import feedparser
 import requests
@@ -32,6 +34,13 @@ COLLECT_BUDGET = 180
 RUN_BUDGET = 12 * 60
 CHECKPOINT_EVERY = 5
 MAX_METRICS_HISTORY = 12
+DEFAULT_ARTICLE_MAX_AGE_HOURS = 24
+FUTURE_DATE_TOLERANCE_SECONDS = 5 * 60
+MAX_FUTURE_DATE_DAYS = 7
+UNKNOWN_DATE_QUARANTINE_SECONDS = 24 * 3600
+MAX_DATE_QUARANTINE = 500
+MAX_ADMISSION_BUFFER = 1000
+MAX_URL_SEEN = 5000
 DEFAULT_ESTIMATED_SEND_SECONDS = 0.5
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 GDATA = re.compile(r"https?://gdata\.youtube\.com/feeds/base/users/([^/]+)/uploads")
@@ -95,6 +104,20 @@ def get_telegram_interval_seconds(value=None):
     return interval
 
 
+def get_article_max_age_seconds(value=None):
+    """Lit la fenêtre de fraîcheur RSS configurable, en heures entières positives."""
+    raw = os.getenv(
+        "ARTICLE_MAX_AGE_HOURS", str(DEFAULT_ARTICLE_MAX_AGE_HOURS),
+    ) if value is None else value
+    try:
+        hours = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("ARTICLE_MAX_AGE_HOURS doit être un entier positif") from exc
+    if hours <= 0:
+        raise ValueError("ARTICLE_MAX_AGE_HOURS doit être un entier positif")
+    return hours * 3600
+
+
 def _utc_iso(timestamp=None):
     moment = datetime.now(timezone.utc) if timestamp is None else datetime.fromtimestamp(
         float(timestamp), timezone.utc,
@@ -155,6 +178,9 @@ def load_state(path="state.json"):
     state.setdefault("last_successful_send_at", None)
     state.setdefault("last_successful_message_id", None)
     state.setdefault("metrics_history", [])
+    state.setdefault("admission_buffer", [])
+    state.setdefault("date_quarantine", [])
+    state.setdefault("url_seen", [])
     if (not isinstance(state["vus"], list) or not isinstance(state["file"], list)
             or not isinstance(state["erreurs"], list)):
         raise ValueError("Format invalide dans state.json : listes 'vus', 'file' et 'erreurs' requises")
@@ -164,6 +190,56 @@ def load_state(path="state.json"):
         raise ValueError("Format invalide dans state.json : 'feed_health'")
     if not isinstance(state["metrics_history"], list):
         raise ValueError("Format invalide dans state.json : 'metrics_history'")
+    if (not isinstance(state["admission_buffer"], list)
+            or not isinstance(state["date_quarantine"], list)
+            or not isinstance(state["url_seen"], list)):
+        raise ValueError(
+            "Format invalide dans state.json : 'admission_buffer', "
+            "'date_quarantine' ou 'url_seen'",
+        )
+    for buffer_name in ("admission_buffer", "date_quarantine"):
+        for record in state[buffer_name]:
+            if not isinstance(record, dict):
+                raise ValueError(f"Format invalide dans state.json : '{buffer_name}'")
+            if not isinstance(record.get("item"), dict):
+                raise ValueError(
+                    f"Format invalide dans state.json : article de '{buffer_name}'",
+                )
+            uid = record.get("uid")
+            if uid is not None and not isinstance(uid, str):
+                raise ValueError(
+                    f"Format invalide dans state.json : identifiant de '{buffer_name}'",
+                )
+            fingerprint = record.get("url_hash")
+            if fingerprint is not None and (
+                not isinstance(fingerprint, str)
+                or not re.fullmatch(r"[0-9a-f]{32}", fingerprint)
+            ):
+                raise ValueError(
+                    f"Format invalide dans state.json : empreinte de '{buffer_name}'",
+                )
+            for timestamp_name in ("first_seen_at", "admitted_at"):
+                timestamp = record.get(timestamp_name)
+                if timestamp is None and timestamp_name not in record:
+                    continue
+                if (isinstance(timestamp, bool)
+                        or not isinstance(timestamp, (int, float))
+                        or not math.isfinite(timestamp) or timestamp < 0):
+                    raise ValueError(
+                        f"Format invalide dans state.json : {timestamp_name} de '{buffer_name}'",
+                    )
+            published_at = record.get("published_at")
+            if published_at is not None and (
+                isinstance(published_at, bool)
+                or not isinstance(published_at, (int, float))
+                or not math.isfinite(published_at)
+            ):
+                raise ValueError(
+                    f"Format invalide dans state.json : date de '{buffer_name}'",
+                )
+    if any(not isinstance(value, str) for value in state["url_seen"]):
+        raise ValueError("Format invalide dans state.json : 'url_seen'")
+    state["url_seen"] = list(dict.fromkeys(state["url_seen"]))[-MAX_URL_SEEN:]
     if not isinstance(state["feed_offset"], int):
         raise ValueError("Format invalide dans state.json : 'feed_offset'")
     last_send = state["last_successful_send_at"]
@@ -188,6 +264,9 @@ def save_state(state, seen, path="state.json"):
     target.parent.mkdir(parents=True, exist_ok=True)
     state["vus"] = list(seen)[-5000:]
     state["erreurs"] = state.get("erreurs", [])[-MAX_ERREURS:]
+    state["url_seen"] = list(dict.fromkeys(state.get("url_seen", [])))[-MAX_URL_SEEN:]
+    state.setdefault("admission_buffer", [])
+    state.setdefault("date_quarantine", [])
     temp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -292,16 +371,230 @@ def _feed_label(url):
     return f"{host}#{fingerprint}"
 
 
-def _oldest_pending_age_seconds(queue, now_epoch=None):
-    """Âge depuis la mise en file, jamais depuis la date RSS."""
-    if not queue or not isinstance(queue[0], dict):
+def _canonical_url_fingerprint(value):
+    """Hash URL sans fragment; conserve chemin et requête pour éviter les collisions sémantiques."""
+    try:
+        parsed = urlsplit(str(value or "").strip())
+        if parsed.scheme.lower() not in ("http", "https") or not parsed.hostname:
+            return None
+        host = parsed.hostname.rstrip(".").encode("idna").decode("ascii").lower()
+        port = parsed.port
+        if port and not (
+            parsed.scheme.lower() == "http" and port == 80
+            or parsed.scheme.lower() == "https" and port == 443
+        ):
+            host = f"{host}:{port}"
+        canonical = urlunsplit((
+            parsed.scheme.lower(), host, parsed.path or "/", parsed.query, "",
+        ))
+    except (TypeError, ValueError, UnicodeError):
         return None
-    queued_at = queue[0].get("queued_at")
-    if (isinstance(queued_at, bool) or not isinstance(queued_at, (int, float))
-            or not math.isfinite(queued_at) or queued_at < 0):
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+
+def _publication_timestamp(entry):
+    """Retourne la date de publication fiable; une date de mise à jour est ignorée."""
+    raw = entry.get("published")
+    if raw is not None:
+        raw = str(raw).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}|\d{8}", raw):
+            return None
+
+    parsed = entry.get("published_parsed")
+    if parsed is not None:
+        try:
+            if isinstance(parsed, datetime):
+                moment = parsed
+                if moment.tzinfo is None:
+                    moment = moment.replace(tzinfo=timezone.utc)
+                return moment.timestamp()
+            parts = tuple(parsed)
+            if len(parts) >= 6:
+                return float(calendar.timegm(parts))
+        except (OverflowError, TypeError, ValueError):
+            pass
+
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            moment = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    try:
+        timestamp = moment.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+    return timestamp if math.isfinite(timestamp) else None
+
+
+def _classify_publication(entry, now_epoch, max_age_seconds):
+    published_at = _publication_timestamp(entry)
+    if published_at is None:
+        return "unknown", None, None
+    age = float(now_epoch) - published_at
+    if age < -FUTURE_DATE_TOLERANCE_SECONDS:
+        return "future", published_at, age
+    if age > max_age_seconds:
+        return "stale", published_at, age
+    return "fresh", published_at, age
+
+
+def _age_bucket(age_seconds):
+    if age_seconds is None:
+        return "unknown"
+    if age_seconds < 0:
+        return "future"
+    if age_seconds < 3600:
+        return "under_1h"
+    if age_seconds < 6 * 3600:
+        return "1_to_6h"
+    if age_seconds <= 24 * 3600:
+        return "6_to_24h"
+    return "over_24h"
+
+
+def _remember_url(state, fingerprint):
+    if fingerprint:
+        values = state.setdefault("url_seen", [])
+        if fingerprint not in values:
+            values.append(fingerprint)
+            if len(values) > MAX_URL_SEEN:
+                del values[:-MAX_URL_SEEN]
+
+
+def _entry_uid(entry):
+    value = entry.get("id") or entry.get("link")
+    return str(value) if value else None
+
+
+def _quarantine_match(state, uid, fingerprint):
+    for index, record in enumerate(state.get("date_quarantine", [])):
+        if uid and record.get("uid") == uid:
+            return index
+        if fingerprint and record.get("url_hash") == fingerprint:
+            return index
+    return None
+
+
+def _quarantine_deadline(record, max_age_seconds):
+    if record.get("reason") == "unknown_date":
+        return float(record.get("first_seen_at", 0)) + UNKNOWN_DATE_QUARANTINE_SECONDS
+    if record.get("reason") == "future_date":
+        published_at = record.get("published_at")
+        first_seen = float(record.get("first_seen_at", 0))
+        if published_at is not None and published_at - first_seen <= (
+            MAX_FUTURE_DATE_DAYS * 86400
+        ):
+            return float(published_at) + max_age_seconds
+        return first_seen + UNKNOWN_DATE_QUARANTINE_SECONDS
+    return None
+
+
+def _make_quarantine_record(uid, fingerprint, item, now_epoch, reason, published_at):
+    return {
+        "uid": uid,
+        "url_hash": fingerprint,
+        "item": item,
+        "first_seen_at": float(now_epoch),
+        "reason": reason,
+        "published_at": published_at,
+    }
+
+
+def _admit_item(state, uid, fingerprint, item, now_epoch,
+                first_seen_at=None, admitted_at=None):
+    """Persistently accepts a fresh item without expiring it while it waits."""
+    state.setdefault("file", [])
+    buffer = state.setdefault("admission_buffer", [])
+    first_seen_at = now_epoch if first_seen_at is None else first_seen_at
+    admitted_at = now_epoch if admitted_at is None else admitted_at
+    if len(state["file"]) < MAX_FILE and not buffer:
+        queued = dict(item)
+        queued.setdefault("queued_at", float(now_epoch))
+        queued.setdefault("first_seen_at", float(first_seen_at))
+        queued.setdefault("admitted_at", float(admitted_at))
+        state["file"].append(queued)
+        target = "file"
+    elif len(buffer) < MAX_ADMISSION_BUFFER:
+        buffer.append({
+            "uid": uid,
+            "url_hash": fingerprint,
+            "item": dict(item),
+            "first_seen_at": float(first_seen_at),
+            "admitted_at": float(admitted_at),
+        })
+        target = "admission_buffer"
+    else:
+        return False
+    _remember_url(state, fingerprint)
+    return target
+
+
+def _drain_admission_buffer(state, now_epoch):
+    """Promotes the oldest admitted records after all already queued items."""
+    state.setdefault("file", [])
+    buffer = state.setdefault("admission_buffer", [])
+    promoted = 0
+    while buffer and len(state["file"]) < MAX_FILE:
+        record = buffer.pop(0)
+        item = dict(record.get("item") or {})
+        item.setdefault("queued_at", float(now_epoch))
+        item.setdefault("first_seen_at", float(record.get("first_seen_at", now_epoch)))
+        item.setdefault("admitted_at", float(record.get("admitted_at", now_epoch)))
+        state["file"].append(item)
+        promoted += 1
+    return promoted
+
+
+def _refresh_quarantine_record(record, entry, item, uid, fingerprint, now_epoch,
+                               max_age_seconds):
+    """Updates quarantined source metadata and returns fresh/stale/held status."""
+    status, published_at, age = _classify_publication(
+        entry, now_epoch, max_age_seconds,
+    )
+    record["uid"] = uid or record.get("uid")
+    record["url_hash"] = fingerprint or record.get("url_hash")
+    record["item"] = item
+    record["last_checked_at"] = float(now_epoch)
+    if status == "unknown":
+        record["reason"] = "unknown_date"
+        return "held", None, None
+    if status == "future":
+        record["reason"] = "future_date"
+        record["published_at"] = published_at
+        return "held", published_at, age
+    if status == "stale":
+        return "stale", published_at, age
+    record["published_at"] = published_at
+    # The freshness check occurs now. If storage is full, retain the candidate
+    # durably in quarantine without reapplying the 24-hour rule on a later run.
+    record["reason"] = "admission_deferred"
+    record["admitted_at"] = float(now_epoch)
+    return "fresh", published_at, age
+
+
+def _oldest_pending_age_seconds(queue, now_epoch=None, admission_buffer=None):
+    """Âge depuis queued_at/admitted_at, jamais depuis la date RSS."""
+    timestamps = []
+    if queue and isinstance(queue[0], dict):
+        timestamps.append(queue[0].get("queued_at"))
+    if admission_buffer and isinstance(admission_buffer[0], dict):
+        timestamps.append(admission_buffer[0].get("admitted_at"))
+    timestamps = [
+        value for value in timestamps
+        if not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value) and value >= 0
+    ]
+    if not timestamps:
         return None
     now = time.time() if now_epoch is None else float(now_epoch)
-    return round(max(0.0, now - queued_at), 3)
+    return round(max(0.0, now - min(timestamps)), 3)
 
 
 def _store_run_metrics(state, metrics):
@@ -314,16 +607,39 @@ def _store_run_metrics(state, metrics):
         "articles_discovered": metrics.get("articles_discovered", 0),
         "articles_admissible": metrics.get("articles_admissible", 0),
         "articles_added": metrics.get("articles_added", 0),
+        "articles_admitted": metrics.get("articles_admitted", 0),
+        "articles_promoted_from_admission_buffer": metrics.get(
+            "articles_promoted_from_admission_buffer", 0,
+        ),
+        "articles_added_to_admission_buffer": metrics.get(
+            "articles_added_to_admission_buffer", 0,
+        ),
+        "articles_rejected_as_stale": metrics.get("articles_rejected_as_stale", 0),
+        "articles_without_reliable_pubdate": metrics.get(
+            "articles_without_reliable_pubdate", 0,
+        ),
+        "articles_with_future_pubdate": metrics.get("articles_with_future_pubdate", 0),
+        "articles_quarantined": metrics.get("articles_quarantined", 0),
+        "quarantine_rechecks": metrics.get("quarantine_rechecks", 0),
+        "quarantine_released": metrics.get("quarantine_released", 0),
+        "quarantine_expired": metrics.get("quarantine_expired", 0),
+        "age_distribution": metrics.get("age_distribution", {}),
         "articles_rejected_by_freshness": metrics.get("articles_rejected_by_freshness", 0),
         "articles_skipped_by_seen_id": metrics.get("articles_skipped_by_seen_id", 0),
         "articles_skipped_by_feed_cursor": metrics.get("articles_skipped_by_feed_cursor", 0),
         "articles_with_pubdate": metrics.get("articles_with_pubdate", 0),
         "articles_without_pubdate": metrics.get("articles_without_pubdate", 0),
         "freshness_policy_enabled": metrics.get("freshness_policy_enabled", False),
+        "article_max_age_hours": metrics.get("article_max_age_hours", 24),
         "published": metrics.get("published", 0),
         "rss_deferred": metrics.get("rss_deferred", 0),
         "queue_initial": metrics.get("queue_initial", 0),
         "queue_final": metrics.get("queue_final", 0),
+        "admission_buffer_initial": metrics.get("admission_buffer_initial", 0),
+        "admission_buffer_final": metrics.get("admission_buffer_final", 0),
+        "date_quarantine_initial": metrics.get("date_quarantine_initial", 0),
+        "date_quarantine_final": metrics.get("date_quarantine_final", 0),
+        "pending_total_final": metrics.get("pending_total_final", 0),
         "oldest_pending_age_seconds": metrics.get("oldest_pending_age_seconds"),
         "collection_seconds": metrics.get("collection_seconds", 0),
         "publication_seconds": metrics.get("publication_seconds", 0),
@@ -354,15 +670,49 @@ def collect_articles(
     feeds, state, http=requests, parser=feedparser.parse,
     budget=COLLECT_BUDGET, clock=time.monotonic, checkpoint=None,
     checkpoint_every=CHECKPOINT_EVERY, metrics=None, queue_clock=time.time,
+    max_age_seconds=None,
 ):
     state.setdefault("feed_health", {})
     state.setdefault("feeds", [])
     state.setdefault("file", [])
     state.setdefault("vus", [])
     state.setdefault("yt", {})
+    state.setdefault("admission_buffer", [])
+    state.setdefault("date_quarantine", [])
+    state.setdefault("url_seen", [])
+    max_age_seconds = (
+        get_article_max_age_seconds() if max_age_seconds is None
+        else int(max_age_seconds)
+    )
+    if max_age_seconds <= 0:
+        raise ValueError("La fenêtre de fraîcheur doit être positive")
+    now_epoch = float(queue_clock())
     queue_initial = len(state["file"])
+    admission_initial = len(state["admission_buffer"])
+    quarantine_initial = len(state["date_quarantine"])
     queue_max = queue_initial
     seen = dict.fromkeys(state["vus"])
+    # Un GUID peut ressembler à une URL sans être le lien de l'article. Ne pas
+    # fabriquer de correspondance URL à partir de l'ancien historique d'IDs.
+    url_seen = set(state["url_seen"])
+    active_url_seen = set()
+    for item in state["file"]:
+        if isinstance(item, dict):
+            fingerprint = _canonical_url_fingerprint(item.get("link"))
+            _remember_url(state, fingerprint)
+            if fingerprint:
+                active_url_seen.add(fingerprint)
+    for record in state["admission_buffer"] + state["date_quarantine"]:
+        if record.get("uid"):
+            seen[str(record["uid"])] = None
+        fingerprint = record.get("url_hash")
+        if not fingerprint and isinstance(record.get("item"), dict):
+            fingerprint = _canonical_url_fingerprint(record["item"].get("link"))
+            record["url_hash"] = fingerprint
+        _remember_url(state, fingerprint)
+        if fingerprint:
+            active_url_seen.add(fingerprint)
+
     # Les états historiques sans init mais avec de l’activité sont déjà en service.
     was_initialized = (
         bool(state["init"]) if "init" in state
@@ -382,10 +732,69 @@ def collect_articles(
         "ok": 0, "empty": 0, "error": 0, "http_error": 0,
         "deferred_feeds": 0, "entries_examined": 0,
         "discovered": 0, "admissible": 0, "added": 0,
-        "deferred": 0, "freshness_rejected": 0, "invalid_link": 0,
+        "admitted": 0, "buffered": 0, "deferred": 0,
+        "buffer_promoted": 0,
+        "freshness_rejected": 0, "unknown_date": 0, "future_date": 0,
+        "quarantined": 0, "quarantine_rechecked": 0,
+        "quarantine_expired": 0, "quarantine_released": 0,
+        "invalid_link": 0,
         "duplicate_id": 0, "cursor_skipped": 0,
-        "pubdate_known": 0, "pubdate_unknown": 0, "attempted": 0,
+        "pubdate_known": 0, "pubdate_unknown": 0,
+        "age_distribution": {
+            "under_1h": 0, "1_to_6h": 0, "6_to_24h": 0,
+            "over_24h": 0, "future": 0, "unknown": 0,
+        },
+        "attempted": 0,
     }
+    promoted = _drain_admission_buffer(state, now_epoch)
+    queue_max = max(queue_max, len(state["file"]))
+    if promoted:
+        counts["buffer_promoted"] += promoted
+        counts["added"] += promoted
+
+    # Libérer avant le parcours RSS les dates inconnues arrivées à échéance,
+    # afin qu'elles ne bloquent pas inutilement une nouvelle entrée.
+    quarantine = state["date_quarantine"]
+    expiration_now = float(queue_clock())
+    for record in list(quarantine):
+        if (record.get("reason") == "unknown_date"
+                and expiration_now >= _quarantine_deadline(record, max_age_seconds)):
+            quarantine.remove(record)
+            if record.get("uid"):
+                seen[str(record["uid"])] = None
+            _remember_url(state, record.get("url_hash"))
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            counts["freshness_rejected"] += 1
+            counts["quarantine_expired"] += 1
+
+    # Les articles déjà admis gardent leur éligibilité et sont réessayés avant
+    # de consulter de nouvelles dates RSS.
+    for record in list(quarantine):
+        reason = record.get("reason")
+        if reason == "admission_deferred":
+            record_now = float(queue_clock())
+            target = _admit_item(
+                state, str(record.get("uid") or ""),
+                record.get("url_hash"), record.get("item") or {}, record_now,
+                first_seen_at=record.get("first_seen_at", now_epoch),
+                admitted_at=record.get("admitted_at", now_epoch),
+            )
+            if target:
+                seen[str(record.get("uid") or "")] = None
+                quarantine.remove(record)
+                counts["quarantine_released"] += 1
+                counts["admitted"] += 1
+                if record.get("url_hash"):
+                    url_seen.add(record["url_hash"])
+                    active_url_seen.add(record["url_hash"])
+                if target == "file":
+                    counts["added"] += 1
+                else:
+                    counts["buffered"] += 1
+                queue_max = max(queue_max, len(state["file"]))
+
     for index, url in enumerate(ordered_feeds):
         if clock() - started >= budget:
             break
@@ -452,23 +861,101 @@ def collect_articles(
         current_cursor = cursor_uid
         blocked_cursor = False
         for entry_index, entry in enumerate(ordered_entries):
-            uid = entry.get("id") or entry.get("link")
+            uid = _entry_uid(entry)
             if not uid:
                 continue
-            uid = str(uid)
-            # Les entrées antérieures au curseur ont déjà été parcourues, même
-            # si leur ID a été éjecté de la fenêtre globale des 5 000 vus.
-            if cursor_index >= 0 and entry_index < cursor_index:
-                counts["cursor_skipped"] += 1
+            fingerprint = _canonical_url_fingerprint(entry.get("link"))
+            quarantine_index = _quarantine_match(state, uid, fingerprint)
+            if quarantine_index is not None:
+                record = state["date_quarantine"][quarantine_index]
+                if record.get("reason") == "admission_deferred":
+                    counts["cursor_skipped"] += 1
+                    if not blocked_cursor:
+                        current_cursor = uid
+                    continue
+                item = format_item(entry)
+                if item is None:
+                    counts["invalid_link"] += 1
+                    blocked_cursor = True
+                    continue
+                counts["quarantine_rechecked"] += 1
+                record_now = float(queue_clock())
+                status, published_at, age = _refresh_quarantine_record(
+                    record, entry, item, uid, fingerprint, record_now,
+                    max_age_seconds,
+                )
+                counts["age_distribution"][_age_bucket(age)] += 1
+                if status == "stale":
+                    state["date_quarantine"].pop(quarantine_index)
+                    seen[uid] = None
+                    _remember_url(state, fingerprint)
+                    url_seen.add(fingerprint) if fingerprint else None
+                    counts["freshness_rejected"] += 1
+                    counts["quarantine_expired"] += 1
+                    if not blocked_cursor:
+                        current_cursor = uid
+                elif status == "fresh":
+                    counts["admissible"] += 1
+                    if age is not None and age < 0:
+                        counts["future_date"] += 1
+                    target = _admit_item(
+                        state, uid, fingerprint, item, record_now,
+                        first_seen_at=record.get("first_seen_at", now_epoch),
+                        admitted_at=record.get("admitted_at", now_epoch),
+                    )
+                    if target:
+                        state["date_quarantine"].pop(quarantine_index)
+                        seen[uid] = None
+                        counts["quarantine_released"] += 1
+                        counts["admitted"] += 1
+                        if fingerprint:
+                            url_seen.add(fingerprint)
+                        active_url_seen.add(fingerprint)
+                        if target == "file":
+                            counts["added"] += 1
+                        else:
+                            counts["buffered"] += 1
+                        queue_max = max(queue_max, len(state["file"]))
+                        if not blocked_cursor:
+                            current_cursor = uid
+                    else:
+                        record["reason"] = "admission_deferred"
+                        record["admitted_at"] = record_now
+                        counts["deferred"] += 1
+                else:
+                    if status == "unknown":
+                        counts["unknown_date"] += 1
+                    else:
+                        counts["future_date"] += 1
+                    if not blocked_cursor:
+                        current_cursor = uid
                 continue
-            if cursor_index >= 0 and entry_index == cursor_index:
-                counts["cursor_skipped"] += 1
+
+            # Les articles déjà traités sont filtrés par ID puis URL canonique,
+            # indépendamment de l'ordre courant du flux.
+            if uid in seen:
+                counts["duplicate_id"] += 1
+                _remember_url(state, fingerprint)
+                if fingerprint:
+                    url_seen.add(fingerprint)
+                if not blocked_cursor:
+                    current_cursor = uid
+                continue
+            if fingerprint and (
+                    fingerprint in url_seen or fingerprint in active_url_seen):
+                counts["duplicate_id"] += 1
+                seen[uid] = None
                 if not blocked_cursor:
                     current_cursor = uid
                 continue
 
-            if uid in seen:
-                counts["duplicate_id"] += 1
+            if cursor_index >= 0 and entry_index == cursor_index:
+                counts["cursor_skipped"] += 1
+                seen[uid] = None
+                _remember_url(state, fingerprint)
+                if fingerprint:
+                    url_seen.add(fingerprint)
+                    active_url_seen.add(fingerprint)
                 if not blocked_cursor:
                     current_cursor = uid
                 continue
@@ -484,33 +971,72 @@ def collect_articles(
             is_latest_new_feed_item = is_new_feed and entry_index == len(entries) - 1
             if is_new_feed and (silent_bootstrap or not is_latest_new_feed_item):
                 seen[uid] = None
+                _remember_url(state, fingerprint)
+                if fingerprint:
+                    url_seen.add(fingerprint)
                 if not blocked_cursor:
                     current_cursor = uid
                 continue
 
             counts["discovered"] += 1
-            # Le filtre de fraîcheur sera inséré ici lors d'une phase future.
-            # Il est actuellement inactif : tout candidat valide est admissible.
-            counts["admissible"] += 1
-            if item["pub"]:
-                counts["pubdate_known"] += 1
-            else:
+            article_now = float(queue_clock())
+            status, published_at, age = _classify_publication(
+                entry, article_now, max_age_seconds,
+            )
+            counts["age_distribution"][_age_bucket(age)] += 1
+            if age is None:
                 counts["pubdate_unknown"] += 1
+                counts["unknown_date"] += 1
+            else:
+                counts["pubdate_known"] += 1
+                if age < 0:
+                    counts["future_date"] += 1
 
-            # Ne pas faire croître la file sans limite : un article non ajouté
-            # n'est pas marqué comme vu et sera réessayé au passage suivant.
-            if len(state["file"]) >= MAX_FILE:
+            if status == "stale":
+                seen[uid] = None
+                _remember_url(state, fingerprint)
+                if fingerprint:
+                    url_seen.add(fingerprint)
+                counts["freshness_rejected"] += 1
+                if not blocked_cursor:
+                    current_cursor = uid
+                continue
+
+            if status in ("unknown", "future"):
+                if len(state["date_quarantine"]) >= MAX_DATE_QUARANTINE:
+                    feed_deferred += 1
+                    counts["deferred"] += 1
+                    blocked_cursor = True
+                    continue
+                reason = "unknown_date" if status == "unknown" else "future_date"
+                state["date_quarantine"].append(_make_quarantine_record(
+                    uid, fingerprint, item, article_now, reason, published_at,
+                ))
+                if fingerprint:
+                    active_url_seen.add(fingerprint)
+                counts["quarantined"] += 1
+                if not blocked_cursor:
+                    current_cursor = uid
+                continue
+
+            counts["admissible"] += 1
+            target = _admit_item(state, uid, fingerprint, item, article_now)
+            if not target:
                 feed_deferred += 1
                 counts["deferred"] += 1
                 blocked_cursor = True
                 continue
-
             seen[uid] = None
-            item["queued_at"] = float(queue_clock())
-            state["file"].append(item)
-            counts["added"] += 1
-            feed_added += 1
+            counts["admitted"] += 1
+            if target == "file":
+                counts["added"] += 1
+                feed_added += 1
+            else:
+                counts["buffered"] += 1
             queue_max = max(queue_max, len(state["file"]))
+            if fingerprint:
+                url_seen.add(fingerprint)
+                active_url_seen.add(fingerprint)
             if not blocked_cursor:
                 current_cursor = uid
 
@@ -529,12 +1055,80 @@ def collect_articles(
         if checkpoint and (index + 1) % max(1, checkpoint_every) == 0:
             checkpoint(state, seen)
 
+    # Une date future doit être revalidée contre le flux disponible avant son
+    # admission : l'éditeur peut avoir corrigé la date depuis sa découverte.
+    # Si le flux est indisponible ou ne contient plus l'entrée, la date fiable
+    # mémorisée permet tout de même une reprise dès qu'elle devient admissible.
+    for record in list(quarantine):
+        if record.get("reason") != "future_date":
+            continue
+        record_now = float(queue_clock())
+        published_at = record.get("published_at")
+        if (isinstance(published_at, bool)
+                or not isinstance(published_at, (int, float))
+                or not math.isfinite(published_at)):
+            continue
+        age = record_now - float(published_at)
+        first_seen = float(record.get("first_seen_at", now_epoch))
+        if (
+            float(published_at) - first_seen > MAX_FUTURE_DATE_DAYS * 86400
+            and record_now - first_seen >= UNKNOWN_DATE_QUARANTINE_SECONDS
+        ):
+            quarantine.remove(record)
+            if record.get("uid"):
+                seen[str(record["uid"])] = None
+            _remember_url(state, record.get("url_hash"))
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            counts["freshness_rejected"] += 1
+            counts["quarantine_expired"] += 1
+            continue
+        if age < -FUTURE_DATE_TOLERANCE_SECONDS:
+            continue
+        if age > max_age_seconds:
+            quarantine.remove(record)
+            if record.get("uid"):
+                seen[str(record["uid"])] = None
+            _remember_url(state, record.get("url_hash"))
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            counts["freshness_rejected"] += 1
+            counts["quarantine_expired"] += 1
+            continue
+        record["reason"] = "admission_deferred"
+        record["admitted_at"] = record_now
+        counts["admissible"] += 1
+        target = _admit_item(
+            state, str(record.get("uid") or ""),
+            record.get("url_hash"), record.get("item") or {}, record_now,
+            first_seen_at=record.get("first_seen_at", now_epoch),
+            admitted_at=record_now,
+        )
+        if target:
+            seen[str(record.get("uid") or "")] = None
+            quarantine.remove(record)
+            counts["quarantine_released"] += 1
+            counts["admitted"] += 1
+            if record.get("url_hash"):
+                url_seen.add(record["url_hash"])
+                active_url_seen.add(record["url_hash"])
+            if target == "file":
+                counts["added"] += 1
+            else:
+                counts["buffered"] += 1
+            queue_max = max(queue_max, len(state["file"]))
+        else:
+            counts["deferred"] += 1
+
     completed = counts["attempted"] == len(ordered_feeds)
     if completed and feeds:
         # Après un cycle complet, décaler le début d’un flux pour l’équité.
         state["feed_offset"] = (offset + 1) % len(feeds)
     elif not feeds:
         state["feed_offset"] = 0
+    state["url_seen"] = list(dict.fromkeys(state["url_seen"]))[-MAX_URL_SEEN:]
     state["init"] = True
     recurrent = [
         _feed_label(url) for url, health in state["feed_health"].items()
@@ -549,6 +1143,13 @@ def collect_articles(
         "| entrées examinées:", counts["entries_examined"],
         "| découverts:", counts["discovered"],
         "| admissibles:", counts["admissible"], "| ajoutés:", counts["added"],
+        "| admis:", counts["admitted"], "| tampon_admission:", counts["buffered"],
+        "| quarantaine_dates:", len(state["date_quarantine"]),
+        "| quarantaine_expirée:", counts["quarantine_expired"],
+        "| doublons_URL_ou_ID:", counts["duplicate_id"],
+        "| âge_articles:", json.dumps(
+            counts["age_distribution"], separators=(",", ":"), sort_keys=True,
+        ),
         "| reportés:", counts["deferred"], "| durée:", collection_duration, "s",
         "| défaillances récurrentes:", ", ".join(recurrent) if recurrent else "aucune",
     )
@@ -562,19 +1163,38 @@ def collect_articles(
             "articles_discovered": counts["discovered"],
             "articles_admissible": counts["admissible"],
             "articles_added": counts["added"],
+            "articles_admitted": counts["admitted"],
+            "articles_promoted_from_admission_buffer": counts["buffer_promoted"],
+            "articles_added_to_admission_buffer": counts["buffered"],
+            "articles_rejected_as_stale": counts["freshness_rejected"],
+            "articles_without_reliable_pubdate": counts["unknown_date"],
+            "articles_with_future_pubdate": counts["future_date"],
+            "articles_quarantined": counts["quarantined"],
+            "quarantine_rechecks": counts["quarantine_rechecked"],
+            "quarantine_released": counts["quarantine_released"],
+            "quarantine_expired": counts["quarantine_expired"],
+            "age_distribution": counts["age_distribution"],
             "articles_rejected_by_freshness": counts["freshness_rejected"],
             "articles_skipped_by_seen_id": counts["duplicate_id"],
             "articles_skipped_by_feed_cursor": counts["cursor_skipped"],
             "articles_invalid_link": counts["invalid_link"],
             "articles_with_pubdate": counts["pubdate_known"],
             "articles_without_pubdate": counts["pubdate_unknown"],
-            "freshness_policy_enabled": False,
+            "freshness_policy_enabled": True,
             "rss_deferred": counts["deferred"],
             "rss_errors": counts["error"],
             "rss_http_errors": counts["http_error"],
             "queue_initial": queue_initial,
             "queue_max": queue_max,
             "queue_after_collection": len(state["file"]),
+            "admission_buffer_initial": admission_initial,
+            "admission_buffer_final": len(state["admission_buffer"]),
+            "date_quarantine_initial": quarantine_initial,
+            "date_quarantine_final": len(state["date_quarantine"]),
+            "pending_total_final": (
+                len(state["file"]) + len(state["admission_buffer"])
+                + len(state["date_quarantine"])
+            ),
             "collection_seconds": collection_duration,
         })
     return seen
@@ -707,6 +1327,9 @@ def process_queue(
     interval = get_telegram_interval_seconds(interval_seconds)
     state.setdefault("last_successful_send_at", None)
     state.setdefault("last_successful_message_id", None)
+    state.setdefault("admission_buffer", [])
+    state.setdefault("date_quarantine", [])
+    promoted_during_publication = _drain_admission_buffer(state, clock())
 
     # La file et les identifiants sont persistés avant toute tentative d'envoi.
     save_state(state, seen, state_path)
@@ -807,6 +1430,7 @@ def process_queue(
                 "item": item, "error": str(exc), "failed_at": int(clock()),
             })
             state["file"].pop(0)
+            promoted_during_publication += _drain_admission_buffer(state, clock())
             save_state(state, seen, state_path)
             print("ARTICLE MIS EN QUARANTAINE |", _feed_label(item.get("link", "")), "|", exc)
             queue_max = max(queue_max, len(state["file"]))
@@ -840,6 +1464,7 @@ def process_queue(
         sent += 1
         state["last_successful_send_at"] = successful_at
         state["last_successful_message_id"] = message_id
+        promoted_during_publication += _drain_admission_buffer(state, successful_at)
         try:
             save_state(state, seen, state_path)
         except Exception as exc:
@@ -878,6 +1503,17 @@ def process_queue(
             "queue_before_publication": queue_before,
             "queue_final": len(remaining),
             "queue_max": max(queue_max, len(remaining)),
+            "admission_buffer_final": len(state["admission_buffer"]),
+            "date_quarantine_final": len(state["date_quarantine"]),
+            "pending_total_final": (
+                len(remaining) + len(state["admission_buffer"])
+                + len(state["date_quarantine"])
+            ),
+            "articles_promoted_from_admission_buffer": (
+                int((metrics or {}).get(
+                    "articles_promoted_from_admission_buffer", 0,
+                )) + promoted_during_publication
+            ),
             "published": sent,
             "publication_deferred": len(remaining),
             "publication_seconds": publication_duration,
@@ -915,6 +1551,7 @@ def main():
         dry_run = True
 
     interval_seconds = get_telegram_interval_seconds()
+    freshness_window_seconds = get_article_max_age_seconds()
 
     token = None
     chat_id = None
@@ -929,23 +1566,29 @@ def main():
     feeds = load_feeds(os.getenv("FEEDS_FILE", "feeds.txt"))
     state_path = os.getenv("STATE_FILE", "state.json")
     state = load_state(state_path)
+    state.setdefault("admission_buffer", [])
+    state.setdefault("date_quarantine", [])
+    state.setdefault("url_seen", [])
     history = state.get("metrics_history", [])
     metrics = {
         "run_started_utc": _utc_iso(run_started_epoch),
         "run_started_epoch": run_started_epoch,
         "telegram_interval_configured_seconds": interval_seconds,
+        "article_max_age_hours": freshness_window_seconds / 3600,
         "queue_initial": len(state["file"]),
         "queue_max": len(state["file"]),
     }
     checkpoint = None if dry_run else lambda current, seen: save_state(current, seen, state_path)
     seen = collect_articles(
         feeds, state, budget=min(COLLECT_BUDGET, RUN_BUDGET), checkpoint=checkpoint,
-        metrics=metrics,
+        metrics=metrics, max_age_seconds=freshness_window_seconds,
     )
 
     print("FILE D'ATTENTE avant traitement :", len(state["file"]), "article(s)")
     available_for_publication = max(0.0, RUN_BUDGET - (time.monotonic() - run_started))
-    oldest_age_before = _oldest_pending_age_seconds(state["file"])
+    oldest_age_before = _oldest_pending_age_seconds(
+        state["file"], admission_buffer=state["admission_buffer"],
+    )
     previous_success = state.get("last_successful_send_at")
     seconds_since_last_success = (
         max(0.0, time.time() - previous_success)
@@ -954,7 +1597,7 @@ def main():
     metrics["oldest_pending_age_before_publication_seconds"] = oldest_age_before
     metrics["simulation"] = cadence_simulator.build_simulation(
         history=history,
-        queue_depth=len(state["file"]),
+        queue_depth=len(state["file"]) + len(state["admission_buffer"]),
         oldest_age_seconds=oldest_age_before,
         available_seconds=available_for_publication,
         run_started_epoch=run_started_epoch,
@@ -969,7 +1612,7 @@ def main():
         send_budget_floor_seconds=MAX_TELEGRAM_SEND_BUDGET_SECONDS,
         seconds_since_last_success=seconds_since_last_success,
         max_per_run=MAX_PAR_RUN,
-        max_queue=MAX_FILE,
+        max_queue=MAX_FILE + MAX_ADMISSION_BUFFER,
         send_request_seconds=cadence_simulator.estimated_send_request_seconds(
             history, fallback=DEFAULT_ESTIMATED_SEND_SECONDS,
         ),
@@ -985,6 +1628,12 @@ def main():
         metrics.update({
             "queue_after_publication": len(state["file"]),
             "queue_final": len(state["file"]),
+            "admission_buffer_final": len(state["admission_buffer"]),
+            "date_quarantine_final": len(state["date_quarantine"]),
+            "pending_total_final": (
+                len(state["file"]) + len(state["admission_buffer"])
+                + len(state["date_quarantine"])
+            ),
             "publication_deferred": len(state["file"]),
             "published": 0,
             "publication_seconds": 0.0,
@@ -1002,7 +1651,9 @@ def main():
                 if previous_success is not None else None
             ),
         })
-        metrics["oldest_pending_age_seconds"] = _oldest_pending_age_seconds(state["file"])
+        metrics["oldest_pending_age_seconds"] = _oldest_pending_age_seconds(
+            state["file"], admission_buffer=state["admission_buffer"],
+        )
         metrics["total_seconds"] = round(time.monotonic() - run_started, 3)
         _log_phase51_metrics(metrics)
         return
@@ -1013,7 +1664,15 @@ def main():
         interval_seconds=interval_seconds, time_limit=remaining, metrics=metrics,
     )
     metrics["queue_after_publication"] = metrics.get("queue_final", len(state["file"]))
-    metrics["oldest_pending_age_seconds"] = _oldest_pending_age_seconds(state["file"])
+    metrics["admission_buffer_final"] = len(state["admission_buffer"])
+    metrics["date_quarantine_final"] = len(state["date_quarantine"])
+    metrics["pending_total_final"] = (
+        len(state["file"]) + len(state["admission_buffer"])
+        + len(state["date_quarantine"])
+    )
+    metrics["oldest_pending_age_seconds"] = _oldest_pending_age_seconds(
+        state["file"], admission_buffer=state["admission_buffer"],
+    )
     metrics["total_seconds"] = round(time.monotonic() - run_started, 3)
     _store_run_metrics(state, metrics)
     save_state(state, seen, state_path)

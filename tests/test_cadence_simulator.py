@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -319,7 +320,8 @@ class CadenceSimulationTests(unittest.TestCase):
         feed = "https://example.org/feed"
         entry = {
             "id": "old-rss-date", "title": "Old article",
-            "link": "https://example.org/article", "published": "2001-01-01",
+            "link": "https://example.org/article", "published": "1970-01-01T00:16:39Z",
+            "published_parsed": time.gmtime(999),
         }
         response = Mock(content=b"<rss/>")
         response.raise_for_status.return_value = None
@@ -327,28 +329,31 @@ class CadenceSimulationTests(unittest.TestCase):
         transport.get.return_value = response
         state = {"vus": [], "file": [], "feeds": [feed], "yt": {}, "init": True}
         metrics = {}
-        poster.collect_articles(
+        seen = poster.collect_articles(
             [feed], state, http=transport,
             parser=Mock(return_value=Mock(entries=[entry])),
             metrics=metrics, queue_clock=lambda: 1000,
         )
         self.assertEqual(state["file"][0]["queued_at"], 1000)
-        self.assertEqual(state["file"][0]["pub"], "2001-01-01")
+        self.assertEqual(state["file"][0]["pub"], "1970-01-01T00:16:39Z")
         self.assertEqual(poster._oldest_pending_age_seconds(state["file"], now_epoch=1017), 17)
         self.assertEqual(metrics["articles_discovered"], 1)
         self.assertEqual(metrics["articles_admissible"], 1)
         self.assertEqual(metrics["articles_added"], 1)
         self.assertEqual(metrics["queue_max"], 1)
-        self.assertFalse(metrics["freshness_policy_enabled"])
+        self.assertTrue(metrics["freshness_policy_enabled"])
         self.assertEqual(metrics["articles_rejected_by_freshness"], 0)
         self.assertEqual(metrics["articles_with_pubdate"], 1)
 
     def test_metrics_separate_feed_cursor_skips_id_duplicates_and_admissions(self):
         feed = "https://example.org/feed"
         entries = [
-            {"id": "new", "title": "New", "link": "https://example.org/new"},
-            {"id": "dup", "title": "Dup", "link": "https://example.org/dup"},
-            {"id": "cursor", "title": "Cursor", "link": "https://example.org/cursor"},
+            {"id": "new", "title": "New", "link": "https://example.org/new",
+             "published_parsed": time.gmtime(1000)},
+            {"id": "dup", "title": "Dup", "link": "https://example.org/dup",
+             "published_parsed": time.gmtime(1000)},
+            {"id": "cursor", "title": "Cursor", "link": "https://example.org/cursor",
+             "published_parsed": time.gmtime(1000)},
         ]
         response = Mock(content=b"<rss/>")
         response.raise_for_status.return_value = None
@@ -361,6 +366,7 @@ class CadenceSimulationTests(unittest.TestCase):
             [feed], state, http=Mock(get=Mock(return_value=response)),
             parser=Mock(return_value=Mock(entries=entries)), metrics=metrics,
             queue_clock=lambda: 1000,
+            max_age_seconds=24 * 3600,
         )
         self.assertEqual(metrics["entries_examined"], 3)
         self.assertEqual(metrics["articles_skipped_by_feed_cursor"], 1)
@@ -368,11 +374,15 @@ class CadenceSimulationTests(unittest.TestCase):
         self.assertEqual(metrics["articles_discovered"], 1)
         self.assertEqual(metrics["articles_admissible"], 1)
         self.assertEqual(metrics["articles_added"], 1)
-        self.assertFalse(metrics["freshness_policy_enabled"])
+        self.assertTrue(metrics["freshness_policy_enabled"])
 
     def test_full_queue_counts_admissible_article_without_counting_it_as_added(self):
         feed = "https://example.org/feed"
-        entry = {"id": "deferred", "title": "Deferred", "link": "https://example.org/deferred"}
+        entry = {
+            "id": "deferred", "title": "Deferred",
+            "link": "https://example.org/deferred",
+            "published_parsed": time.gmtime(1_800_000_000),
+        }
         response = Mock(content=b"<rss/>")
         response.raise_for_status.return_value = None
         state = {
@@ -382,15 +392,18 @@ class CadenceSimulationTests(unittest.TestCase):
             "feeds": [feed], "yt": {}, "init": True,
         }
         metrics = {}
-        poster.collect_articles(
+        seen = poster.collect_articles(
             [feed], state, http=Mock(get=Mock(return_value=response)),
             parser=Mock(return_value=Mock(entries=[entry])), metrics=metrics,
+            queue_clock=lambda: 1_800_000_000, max_age_seconds=24 * 3600,
         )
         self.assertEqual(metrics["articles_discovered"], 1)
         self.assertEqual(metrics["articles_admissible"], 1)
         self.assertEqual(metrics["articles_added"], 0)
-        self.assertEqual(metrics["rss_deferred"], 1)
-        self.assertNotIn("deferred", state["vus"])
+        self.assertEqual(metrics["articles_added_to_admission_buffer"], 1)
+        self.assertEqual(metrics["rss_deferred"], 0)
+        self.assertIn("deferred", seen)
+        self.assertEqual(len(state["admission_buffer"]), 1)
         self.assertEqual(len(state["file"]), poster.MAX_FILE)
 
     def test_run_metrics_history_stays_bounded_and_contains_no_article_content(self):
