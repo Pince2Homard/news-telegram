@@ -2,12 +2,14 @@ name: Poster news
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # GitHub Actions ne descend pas sous 5 minutes ; le décalage évite :00.
+    - cron: "2/5 * * * *"
   workflow_dispatch:
 
 concurrency:
   group: poster-production
   cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: write
@@ -35,6 +37,7 @@ jobs:
         env:
           DRY_RUN: "0"
           ALLOW_TELEGRAM_SEND: "1"
+          TELEGRAM_INTERVAL_SECONDS: ${{ vars.TELEGRAM_INTERVAL_SECONDS || '30' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
       - name: Sauvegarder l'état de la file d'attente

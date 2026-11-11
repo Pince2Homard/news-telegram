@@ -2,19 +2,28 @@
 import html
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import feedparser
 import requests
 
-DELAI = 15
-DELAI_RAPIDE = 15
-SEUIL_RAPIDE = 8
+DEFAULT_TELEGRAM_INTERVAL_SECONDS = 30
+MAX_INLINE_CADENCE_WAIT_SECONDS = 120
+TELEGRAM_REQUEST_TIMEOUT_SECONDS = 30
+TELEGRAM_MAX_ATTEMPTS = 3
+TELEGRAM_MAX_RETRY_AFTER_SECONDS = 60
+MAX_TELEGRAM_SEND_BUDGET_SECONDS = (
+    TELEGRAM_MAX_ATTEMPTS * TELEGRAM_REQUEST_TIMEOUT_SECONDS
+    + (TELEGRAM_MAX_ATTEMPTS - 1) * TELEGRAM_MAX_RETRY_AFTER_SECONDS
+)
 MAX_PAR_RUN = 50
 MAX_ERREURS = 500
 MAX_FILE = 1000
@@ -46,6 +55,72 @@ class GlobalTelegramError(Exception):
     """Erreur de configuration ou d’accès Telegram : toute la file doit être préservée."""
 
 
+@dataclass(frozen=True)
+class TelegramSendResult:
+    """Résultat confirmé d'un appel Telegram, sans conserver de donnée secrète."""
+
+    success: bool
+    message_id: int | str | None = None
+    telegram_date: float | None = None
+
+    def __bool__(self):
+        return self.success
+
+
+def get_telegram_interval_seconds(value=None):
+    """Lit une cadence positive configurable par variable d'environnement."""
+    raw = os.getenv("TELEGRAM_INTERVAL_SECONDS", str(DEFAULT_TELEGRAM_INTERVAL_SECONDS)) \
+        if value is None else value
+    try:
+        interval = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("TELEGRAM_INTERVAL_SECONDS doit être un entier positif") from exc
+    if interval <= 0:
+        raise ValueError("TELEGRAM_INTERVAL_SECONDS doit être un entier positif")
+    return interval
+
+
+def _utc_iso(timestamp=None):
+    moment = datetime.now(timezone.utc) if timestamp is None else datetime.fromtimestamp(
+        float(timestamp), timezone.utc,
+    )
+    return moment.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _http_status_from_exception(exc):
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) else None
+
+
+def _http_status_category(status):
+    if status == 401:
+        return "unauthorized"
+    if status == 403:
+        return "forbidden"
+    if status == 404:
+        return "not_found"
+    if status == 410:
+        return "gone"
+    if status == 429:
+        return "rate_limited"
+    if status is not None and status >= 500:
+        return "upstream_error"
+    if status is not None and status >= 400:
+        return "client_error"
+    return "unknown"
+
+
+def _retry_after_seconds(exc):
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    value = headers.get("Retry-After")
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return None
+
+
 def load_state(path="state.json"): 
     try:
         with open(path, encoding="utf-8") as source:
@@ -62,6 +137,8 @@ def load_state(path="state.json"):
     state.setdefault("yt", {})
     state.setdefault("feed_health", {})
     state.setdefault("feed_offset", 0)
+    state.setdefault("last_successful_send_at", None)
+    state.setdefault("last_successful_message_id", None)
     if (not isinstance(state["vus"], list) or not isinstance(state["file"], list)
             or not isinstance(state["erreurs"], list)):
         raise ValueError("Format invalide dans state.json : listes 'vus', 'file' et 'erreurs' requises")
@@ -71,6 +148,15 @@ def load_state(path="state.json"):
         raise ValueError("Format invalide dans state.json : 'feed_health'")
     if not isinstance(state["feed_offset"], int):
         raise ValueError("Format invalide dans state.json : 'feed_offset'")
+    last_send = state["last_successful_send_at"]
+    if (last_send is not None and
+            (isinstance(last_send, bool) or not isinstance(last_send, (int, float))
+             or not math.isfinite(last_send) or last_send < 0)):
+        raise ValueError("Format invalide dans state.json : 'last_successful_send_at'")
+    message_id = state["last_successful_message_id"]
+    if (message_id is not None and
+            (isinstance(message_id, bool) or not isinstance(message_id, (int, str)))):
+        raise ValueError("Format invalide dans state.json : 'last_successful_message_id'")
 
     # Migration non destructive : ne jamais effacer la file d'attente existante.
     if state.get("v") != 2:
@@ -163,7 +249,12 @@ def entries_for_feed(url, state, http=requests, parser=feedparser.parse):
                     state["yt"][username] = found.group(1)
                     break
         except requests.RequestException as exc:
-            print("Erreur résolution YouTube |", type(exc).__name__)
+            status = _http_status_from_exception(exc)
+            print(
+                "Erreur résolution YouTube |", type(exc).__name__,
+                "| HTTP:", status if status is not None else "n/a",
+                "| catégorie:", _http_status_category(status),
+            )
 
     if username in state["yt"]:
         data = parse_feed(
@@ -226,12 +317,21 @@ def collect_articles(
             health["consecutive_errors"] = int(health.get("consecutive_errors", 0)) + 1
             health["last_error"] = type(exc).__name__
             error_duration = round(clock() - feed_started, 3)
+            status = _http_status_from_exception(exc)
+            retry_after = _retry_after_seconds(exc)
+            health["last_http_status"] = status
+            health["last_error_category"] = _http_status_category(status)
             # Log only at powers of two to limit recurring failure noise.
             streak = health["consecutive_errors"]
             if streak & (streak - 1) == 0:
-                print("RSS erreur |", _feed_label(url), "|", type(exc).__name__,
-                      "| échecs consécutifs:", streak,
-                      "| durée:", error_duration, "s")
+                print(
+                    "RSS erreur |", _feed_label(url), "|", type(exc).__name__,
+                    "| HTTP:", status if status is not None else "n/a",
+                    "| catégorie:", _http_status_category(status),
+                    "| retry_after_s:", retry_after if retry_after is not None else "n/a",
+                    "| échecs consécutifs:", streak,
+                    "| durée:", error_duration, "s",
+                )
             state["feed_offset"] = (offset + index + 1) % len(feeds)
             if checkpoint:
                 checkpoint(state, seen)
@@ -245,6 +345,8 @@ def collect_articles(
         health = state["feed_health"].setdefault(url, {"consecutive_errors": 0})
         health["consecutive_errors"] = 0
         health.pop("last_error", None)
+        health.pop("last_http_status", None)
+        health.pop("last_error_category", None)
         if entries and is_new_feed:
             state["feeds"].append(url)
 
@@ -351,47 +453,98 @@ def collect_articles(
     return seen
 
 
-def send_message(item, token, chat_id, http=requests, sleep=time.sleep):
-    for attempt in range(3):
+def send_message(
+    item, token, chat_id, http=requests, sleep=time.sleep,
+    monotonic=time.monotonic, clock=time.time,
+):
+    for attempt in range(TELEGRAM_MAX_ATTEMPTS):
+        attempt_at = clock()
+        request_started = monotonic()
         try:
             response = http.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 data={"chat_id": chat_id, "text": item["text"], "parse_mode": "HTML"},
-                timeout=30,
+                timeout=TELEGRAM_REQUEST_TIMEOUT_SECONDS,
             )
         except requests.RequestException as exc:
             # Résultat ambigu : Telegram a peut-être reçu le message.
-            # Ne pas réessayer automatiquement pour éviter un doublon.
-            print("Résultat d'envoi Telegram incertain, aucun nouvel essai |", type(exc).__name__)
-            return False
+            # Ne pas réessayer automatiquement pour éviter un doublon immédiat.
+            duration = max(0, monotonic() - request_started)
+            status = _http_status_from_exception(exc)
+            print(
+                "TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
+                "| tentative:", f"{attempt + 1}/{TELEGRAM_MAX_ATTEMPTS}",
+                "| résultat: réseau_ambigu | HTTP:", status if status is not None else "n/a",
+                "| durée_s:", round(duration, 3), "| erreur:", type(exc).__name__,
+            )
+            return TelegramSendResult(False)
 
+        duration = max(0, monotonic() - request_started)
+        status = getattr(response, "status_code", None)
         if response.ok:
-            return True
-        if response.status_code == 429:
+            message_id = None
+            telegram_date = None
+            try:
+                payload = response.json()
+            except (ValueError, TypeError):
+                payload = None
+            if isinstance(payload, dict):
+                result = payload.get("result")
+                if isinstance(result, dict):
+                    candidate = result.get("message_id")
+                    if isinstance(candidate, (int, str)) and not isinstance(candidate, bool):
+                        message_id = candidate
+                    candidate_date = result.get("date")
+                    if (isinstance(candidate_date, (int, float))
+                            and not isinstance(candidate_date, bool)):
+                        telegram_date = float(candidate_date)
+            confirmed_at = telegram_date if telegram_date is not None else clock()
+            print(
+                "TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
+                "| tentative:", f"{attempt + 1}/{TELEGRAM_MAX_ATTEMPTS}",
+                "| résultat: succès | HTTP:", status if status is not None else "n/a",
+                "| durée_s:", round(duration, 3),
+                "| confirmé_utc:", _utc_iso(confirmed_at),
+                "| message_id:", message_id if message_id is not None else "indisponible",
+            )
+            return TelegramSendResult(True, message_id, telegram_date)
+
+        if status == 429:
             try:
                 wait = int(response.json()["parameters"]["retry_after"])
             except (KeyError, TypeError, ValueError):
                 wait = 30
-            print("Limite Telegram, attente de", wait, "s")
-            if attempt < 2:
-                sleep(min(max(wait, 1), 60))
+            print(
+                "TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
+                "| tentative:", f"{attempt + 1}/{TELEGRAM_MAX_ATTEMPTS}",
+                "| résultat: rate_limited | HTTP: 429",
+                "| durée_s:", round(duration, 3), "| retry_after_s:", wait,
+            )
+            if attempt < TELEGRAM_MAX_ATTEMPTS - 1:
+                sleep(min(max(wait, 1), TELEGRAM_MAX_RETRY_AFTER_SECONDS))
             continue
 
-        message = f"HTTP {response.status_code}"
-        print("Erreur Telegram HTTP", response.status_code)
-        if response.status_code in (401, 403):
+        message = f"HTTP {status}"
+        print(
+            "TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
+            "| tentative:", f"{attempt + 1}/{TELEGRAM_MAX_ATTEMPTS}",
+            "| résultat: échec | HTTP:", status if status is not None else "n/a",
+            "| catégorie:", _http_status_category(status),
+            "| durée_s:", round(duration, 3),
+        )
+        if status in (401, 403):
             raise GlobalTelegramError(message)
-        if 400 <= response.status_code < 500:
+        if isinstance(status, int) and 400 <= status < 500:
             raise PermanentTelegramError(message)
-        return False
-    return False
+        return TelegramSendResult(False)
+    return TelegramSendResult(False)
 
 
 def process_queue(
     state, seen, token, chat_id, state_path="state.json", dry_run=True,
     sender=send_message, sleep=time.sleep, max_per_run=MAX_PAR_RUN,
-    delay=DELAI, fast_delay=DELAI_RAPIDE, fast_threshold=SEUIL_RAPIDE,
-    time_limit=11 * 60, clock=time.time,
+    interval_seconds=None, time_limit=11 * 60, clock=time.time,
+    monotonic=time.monotonic,
 ):
     if dry_run:
         print("DRY-RUN : aucune requête Telegram et aucune sauvegarde.")
@@ -399,16 +552,71 @@ def process_queue(
             print("SIMULATION |", item.get("pub") or "?", "|", _feed_label(item.get("link", "")))
         return 0
 
+    interval = get_telegram_interval_seconds(interval_seconds)
+    state.setdefault("last_successful_send_at", None)
+    state.setdefault("last_successful_message_id", None)
+
     # La file et les identifiants sont persistés avant toute tentative d'envoi.
     save_state(state, seen, state_path)
-    started = clock()
+    started = monotonic()
     sent = 0
-    while state["file"] and sent < max_per_run and clock() - started < time_limit:
-        if sent:
-            sleep(fast_delay if len(state["file"]) > fast_threshold else delay)
+    last_success = state.get("last_successful_send_at")
+    next_allowed = last_success + interval if last_success is not None else None
+    print(
+        "CADENCE Telegram | intervalle_s:", interval,
+        "| dernier_succès_utc:", _utc_iso(last_success) if last_success is not None else "aucun",
+        "| prochaine_publication_utc:", _utc_iso(next_allowed) if next_allowed is not None else "immédiate",
+        "| file:", len(state["file"]),
+    )
+
+    while state["file"] and sent < max_per_run:
+        elapsed = monotonic() - started
+        remaining_budget = time_limit - elapsed
+        if remaining_budget < MAX_TELEGRAM_SEND_BUDGET_SECONDS:
+            print(
+                "PUBLICATION REPORTÉE | raison: budget_insuffisant",
+                "| file:", len(state["file"]),
+                "| prochaine_publication_utc:", _utc_iso(next_allowed) if next_allowed is not None else "immédiate",
+            )
+            break
+
+        now = clock()
+        last_success = state.get("last_successful_send_at")
+        next_allowed = last_success + interval if last_success is not None else now
+        wait_seconds = max(0, next_allowed - now)
+        if wait_seconds:
+            if wait_seconds > MAX_INLINE_CADENCE_WAIT_SECONDS:
+                print(
+                    "PUBLICATION REPORTÉE | raison: attente_trop_longue_pour_ce_workflow",
+                    "| file:", len(state["file"]),
+                    "| attente_s:", round(wait_seconds, 3),
+                    "| prochaine_publication_utc:", _utc_iso(next_allowed),
+                )
+                break
+            if wait_seconds + MAX_TELEGRAM_SEND_BUDGET_SECONDS > remaining_budget:
+                print(
+                    "PUBLICATION REPORTÉE | raison: budget_insuffisant_avant_prochaine_cadence",
+                    "| file:", len(state["file"]),
+                    "| prochaine_publication_utc:", _utc_iso(next_allowed),
+                )
+                break
+            print(
+                "ATTENTE CADENCE | secondes:", round(wait_seconds, 3),
+                "| file:", len(state["file"]),
+                "| prochaine_publication_utc:", _utc_iso(next_allowed),
+            )
+            sleep(wait_seconds)
+            if clock() < next_allowed:
+                print(
+                    "PUBLICATION REPORTÉE | raison: attente_interrompue",
+                    "| file:", len(state["file"]),
+                    "| prochaine_publication_utc:", _utc_iso(next_allowed),
+                )
+                break
+
         item = state["file"][0]
         try:
-            delivered = sender(item, token, chat_id)
+            outcome = sender(item, token, chat_id)
         except GlobalTelegramError as exc:
             # Erreur globale d'identifiants/droits : ne jamais mettre les articles
             # en quarantaine. On arrête et conserve la file pour correction.
@@ -424,20 +632,51 @@ def process_queue(
             save_state(state, seen, state_path)
             print("ARTICLE MIS EN QUARANTAINE |", _feed_label(item.get("link", "")), "|", exc)
             continue
-        if not delivered:
-            # Résultat ambigu ou erreur temporaire : conserver l’article en tête.
+        if not outcome:
+            # Résultat ambigu ou erreur temporaire : conserver l'article en tête.
             break
-        print("ENVOYÉ | publié:", item.get("pub") or "?", "|", _feed_label(item["link"]))
+
+        telegram_date = outcome.telegram_date if isinstance(outcome, TelegramSendResult) else None
+        message_id = outcome.message_id if isinstance(outcome, TelegramSendResult) else None
+        successful_at = clock()
+        if telegram_date is not None:
+            # Le champ date Telegram est à la seconde : arrondir prudemment vers
+            # le futur pour ne jamais raccourcir l'intervalle minimal.
+            successful_at = max(successful_at, telegram_date + 1)
         state["file"].pop(0)
         sent += 1
-        save_state(state, seen, state_path)
+        state["last_successful_send_at"] = successful_at
+        state["last_successful_message_id"] = message_id
+        try:
+            save_state(state, seen, state_path)
+        except Exception as exc:
+            print(
+                "ALERTE PERSISTANCE | Telegram avait confirmé l'envoi",
+                "| source:", _feed_label(item.get("link", "")),
+                "| message_id:", message_id if message_id is not None else "indisponible",
+                "| état_non_sauvé:", type(exc).__name__,
+                "| doublon_possible_après_reprise: oui",
+            )
+            raise
+        next_allowed = successful_at + interval
+        print(
+            "ENVOYÉ | publié:", item.get("pub") or "?",
+            "| source:", _feed_label(item["link"]),
+            "| confirmé_utc:", _utc_iso(successful_at),
+            "| message_id:", message_id if message_id is not None else "indisponible",
+            "| file:", len(state["file"]),
+            "| prochaine_publication_utc:", _utc_iso(next_allowed),
+        )
 
     save_state(state, seen, state_path)
     remaining = state["file"]
+    last_success = state.get("last_successful_send_at")
+    next_allowed = last_success + interval if last_success is not None else None
     print(
         "FILE D'ATTENTE après envoi :", len(remaining), "article(s) |",
         sent, "envoyé(s) ce passage | plus ancien en attente, publié :",
         (remaining[0].get("pub") or "?") if remaining else "-",
+        "| prochaine_publication_utc:", _utc_iso(next_allowed) if next_allowed is not None else "immédiate",
     )
     return sent
 
@@ -449,6 +688,8 @@ def main():
     allow_send = os.getenv("ALLOW_TELEGRAM_SEND") == "1"
     if not allow_send:
         dry_run = True
+
+    interval_seconds = get_telegram_interval_seconds()
 
     token = None
     chat_id = None
@@ -475,7 +716,7 @@ def main():
     remaining = max(0, RUN_BUDGET - (time.monotonic() - run_started))
     process_queue(
         state, seen, token, chat_id, state_path=state_path, dry_run=False,
-        time_limit=remaining,
+        interval_seconds=interval_seconds, time_limit=remaining,
     )
 
 
