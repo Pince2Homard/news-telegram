@@ -65,7 +65,7 @@ Cette commande utilise une API factice et une notification factice. Elle ne cont
 py -3.12 -c "from tools.windows_watcher.watcher import show_windows_notification; print(show_windows_notification(1))"
 ```
 
-Une bulle générique « 1 nouvel élément de coordination » doit apparaître près de la zone de notification. Cette commande n'appelle pas GitHub, n'écrit aucun état et n'envoie rien à Telegram. Le résultat `True` signifie que PowerShell s'est terminé sans erreur; il ne prouve pas que Windows a effectivement affiché la bulle. Confirmer visuellement l'affichage. Si elle manque, vérifier l'Assistant de concentration, les notifications Windows, la session déverrouillée et les stratégies locales avant de poursuivre.
+Une bulle générique de coordination avec le compteur `1` doit apparaître près de la zone de notification. Cette commande n'appelle pas GitHub, n'écrit aucun état et n'envoie rien à Telegram. Le résultat `True` signifie que PowerShell s'est terminé sans erreur; il ne prouve pas que Windows a effectivement affiché la bulle. Confirmer visuellement l'affichage. Si elle manque, vérifier l'Assistant de concentration, les notifications Windows, la session déverrouillée et les stratégies locales avant de poursuivre.
 
 ### 4. Tester le relevé GitHub avec un état temporaire
 
