@@ -45,9 +45,17 @@ Les tests utilisent des transports simulés et ne publient aucun message Telegra
 ## Collecte et file d'attente
 
 - Les flux RSS/Atom sont téléchargés avec un délai de connexion de 5 s et de lecture de 20 s.
+- La collecte dispose d'un budget de 3 minutes et reprend au prochain flux après chaque point de sauvegarde. L'exécution complète du bot est plafonnée à 12 minutes, sous la limite de 14 minutes du workflow.
+- Le curseur global et le dernier article traité par flux sont écrits dans `state.json` par lots de cinq flux et à la fin de la collecte ; le curseur par flux protège aussi des doublons lorsque l'historique global de 5 000 IDs est tronqué. Le workflow de production ne crée qu'un commit d'état en fin d'exécution, comme auparavant.
 - La file d'attente est plafonnée à 1 000 articles. Quand elle est pleine, les nouveaux articles sont différés et ne sont pas marqués comme vus : ils seront retentés au passage suivant.
+- Au premier démarrage, les articles déjà présents dans les flux sont initialisés silencieusement. Lorsqu'un flux est ajouté à un bot déjà initialisé, ses articles historiques sont ignorés et son article le plus récent est traité normalement ; s'il ne peut pas entrer dans une file pleine, il reste retentable.
 - Les erreurs Telegram définitives sont conservées dans la liste `erreurs`, limitée à 500 entrées.
 - Les flux YouTube par identifiant de chaîne utilisent directement le flux RSS public YouTube. L'ancien format GDATA reste pris en charge par compatibilité.
+- Les journaux de collecte donnent une durée et un résumé par flux. Les erreurs récurrentes sont suivies dans l'état, et les identifiants de journal n'exposent pas les paramètres d'URL.
+
+## Garantie de livraison Telegram
+
+La file assure une livraison « au moins une fois ». Si Telegram accepte un message puis que le processus s'interrompt avant la sauvegarde qui le retire de la file, l'article sera renvoyé après reprise et un doublon est possible. Une erreur réseau ambiguë n'est pas retentée dans le même passage, mais l'article reste en file pour la prochaine exécution. L'architecture actuelle ne garantit pas une livraison exactement une fois.
 
 ## État persistant
 
