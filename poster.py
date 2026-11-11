@@ -321,6 +321,8 @@ def _store_run_metrics(state, metrics):
         "publication_seconds": metrics.get("publication_seconds", 0),
         "total_seconds": metrics.get("total_seconds", 0),
         "intervals_seconds": metrics.get("intervals_seconds", []),
+        "telegram_attempts": metrics.get("telegram_attempts", 0),
+        "telegram_request_duration_seconds": metrics.get("telegram_request_duration_seconds", 0),
         "simulated_interval_seconds": metrics.get("simulation", {})
             .get("recommendation", {}).get("interval_seconds", 30),
         "simulated_candidate_interval_seconds": metrics.get("simulation", {})
@@ -674,6 +676,7 @@ def process_queue(
     sent = 0
     cadence_wait_seconds = 0.0
     telegram_errors = 0
+    telegram_attempts = 0
     telegram_attempt_errors = 0
     telegram_http_errors = 0
     telegram_call_duration = 0.0
@@ -742,6 +745,7 @@ def process_queue(
         except GlobalTelegramError as exc:
             telegram_call_duration += max(0.0, monotonic() - call_started)
             telegram_errors += 1
+            telegram_attempts += 1
             telegram_attempt_errors += 1
             if getattr(exc, "http_status", None) is not None:
                 telegram_http_errors += 1
@@ -752,6 +756,7 @@ def process_queue(
         except PermanentTelegramError as exc:
             telegram_call_duration += max(0.0, monotonic() - call_started)
             telegram_errors += 1
+            telegram_attempts += 1
             telegram_attempt_errors += 1
             if getattr(exc, "http_status", None) is not None:
                 telegram_http_errors += 1
@@ -767,9 +772,12 @@ def process_queue(
             continue
         telegram_call_duration += max(0.0, monotonic() - call_started)
         if isinstance(outcome, TelegramSendResult):
+            telegram_attempts += outcome.attempts
             telegram_attempt_errors += outcome.attempt_errors
             telegram_request_duration += outcome.duration_seconds
             telegram_http_errors += outcome.http_errors
+        else:
+            telegram_attempts += 1
         if not outcome:
             # Résultat ambigu ou erreur temporaire : conserver l'article en tête.
             telegram_errors += 1
@@ -834,6 +842,7 @@ def process_queue(
             "publication_seconds": publication_duration,
             "cadence_wait_seconds": round(cadence_wait_seconds, 3),
             "telegram_errors": telegram_errors,
+            "telegram_attempts": telegram_attempts,
             "telegram_attempt_errors": telegram_attempt_errors,
             "telegram_http_errors": telegram_http_errors,
             "telegram_call_duration_seconds": round(telegram_call_duration, 3),
@@ -925,11 +934,13 @@ def main():
         articles_discovered=metrics.get("articles_discovered", 0),
         previous_simulation=_previous_simulation(history),
         next_run_seconds=_estimated_next_run_seconds(history),
-        send_request_seconds=DEFAULT_ESTIMATED_SEND_SECONDS,
         send_budget_floor_seconds=MAX_TELEGRAM_SEND_BUDGET_SECONDS,
         initial_wait_seconds=simulated_wait,
         max_per_run=MAX_PAR_RUN,
         max_queue=MAX_FILE,
+        send_request_seconds=cadence_simulator.estimated_send_request_seconds(
+            history, fallback=DEFAULT_ESTIMATED_SEND_SECONDS,
+        ),
     )
     if dry_run:
         process_queue(
@@ -944,6 +955,7 @@ def main():
             "publication_seconds": 0.0,
             "cadence_wait_seconds": 0.0,
             "telegram_errors": 0,
+            "telegram_attempts": 0,
             "telegram_attempt_errors": 0,
             "telegram_http_errors": 0,
             "telegram_call_duration_seconds": 0.0,

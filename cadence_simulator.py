@@ -51,6 +51,22 @@ def estimated_arrivals_per_minute(history):
     return max(0.0, sum(count for count, _ in spans) * 60.0 / total_seconds)
 
 
+def estimated_send_request_seconds(history, fallback=0.5):
+    """Latence moyenne par requête à partir des résumés récents disponibles."""
+    durations = 0.0
+    attempts = 0
+    for record in _valid_records(history)[-MAX_SIMULATION_HISTORY:]:
+        duration = _number(record.get("telegram_request_duration_seconds"), None)
+        count = _number(record.get("telegram_attempts"), None)
+        if duration is None or count is None or duration < 0 or count <= 0:
+            continue
+        durations += duration
+        attempts += count
+    if attempts == 0 or durations <= 0:
+        return max(0.01, _number(fallback, 0.5))
+    return min(30.0, max(0.01, durations / attempts))
+
+
 def _target_interval(queue_depth, trend_per_run, oldest_age_seconds):
     """Target de simulation : les seuils ne pilotent jamais le bot réel."""
     depth = max(0, int(queue_depth))
@@ -232,6 +248,7 @@ def build_simulation(
         "recommendation": recommendation,
         "queue_trend_per_run": round(trend, 2),
         "estimated_arrivals_per_minute": round(arrivals, 3),
+        "assumed_send_request_seconds": round(send_request_seconds, 3),
         "assumed_next_run_seconds": round(max(0.0, _number(next_run_seconds)), 2),
         "scenarios": scenarios,
     }

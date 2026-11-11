@@ -44,6 +44,14 @@ class CadenceSimulationTests(unittest.TestCase):
         self.assertTrue(all(item["estimated_published_this_run"] == 0 for item in scenarios))
         self.assertTrue(all(item["estimated_clearance_seconds"] == 0 for item in scenarios))
 
+    def test_request_latency_uses_recent_measurements_and_falls_back_when_missing(self):
+        self.assertEqual(cadence_simulator.estimated_send_request_seconds([]), 0.5)
+        measured = cadence_simulator.estimated_send_request_seconds([
+            {"telegram_request_duration_seconds": 1.2, "telegram_attempts": 3},
+            {"telegram_request_duration_seconds": 0.4, "telegram_attempts": 1},
+        ])
+        self.assertAlmostEqual(measured, 0.4)
+
     def test_light_queue_keeps_comfortable_simulated_cadence(self):
         result = cadence_simulator.build_simulation(
             history=[{"queue_final": 12}, {"queue_final": 15}],
