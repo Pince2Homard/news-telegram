@@ -44,6 +44,112 @@ class CadenceSimulationTests(unittest.TestCase):
         self.assertTrue(all(item["estimated_published_this_run"] == 0 for item in scenarios))
         self.assertTrue(all(item["estimated_clearance_seconds"] == 0 for item in scenarios))
 
+    def test_capacity_boundaries_include_first_send_reserve_wait_and_operation_latency(self):
+        common = {
+            "queue_depth": 10,
+            "interval_seconds": 30,
+            "send_operation_seconds": 2,
+            "send_budget_floor_seconds": 100,
+            "max_per_run": 50,
+        }
+        def capacity(available):
+            row = next(item for item in cadence_simulator.simulate_intervals(
+                queue_depth=common["queue_depth"],
+                available_seconds=available,
+                seconds_since_last_success=25,
+                send_operation_seconds=common["send_operation_seconds"],
+                send_budget_floor_seconds=common["send_budget_floor_seconds"],
+            ) if item["interval_seconds"] == common["interval_seconds"])
+            return row["capacity_this_run"]
+
+        self.assertEqual(capacity(104.99), 0)
+        self.assertEqual(capacity(105), 1)
+        self.assertEqual(capacity(136.99), 1)
+        self.assertEqual(capacity(137), 2)
+
+    def test_capacity_is_monotonic_across_all_simulated_intervals_and_budget_edges(self):
+        scenarios = cadence_simulator.simulate_intervals(
+            queue_depth=100, available_seconds=500,
+            send_budget_floor_seconds=100, send_operation_seconds=0.5,
+        )
+        self.assertEqual([row["interval_seconds"] for row in scenarios], [30, 25, 20, 15, 10])
+        capacities = [row["capacity_this_run"] for row in scenarios]
+        self.assertEqual(capacities, sorted(capacities))
+        below_reserve = cadence_simulator.simulate_intervals(
+            queue_depth=10, available_seconds=209.99,
+            send_budget_floor_seconds=210,
+        )
+        self.assertTrue(all(row["capacity_this_run"] == 0 for row in below_reserve))
+
+    def test_candidate_intervals_have_individual_initial_waits(self):
+        scenarios = cadence_simulator.simulate_intervals(
+            queue_depth=100, available_seconds=720,
+            seconds_since_last_success=15,
+        )
+        self.assertEqual([row["first_wait_seconds"] for row in scenarios], [15, 10, 5, 0, 0])
+
+    def test_workflow_period_reports_observed_spread_and_non_guarantee(self):
+        observed = cadence_simulator.estimate_workflow_interval([
+            {"run_started_epoch": 100},
+            {"run_started_epoch": 400},
+            {"run_started_epoch": 1300},
+        ])
+        self.assertEqual(observed["seconds"], 600)
+        self.assertEqual(observed["samples"], 2)
+        self.assertEqual(observed["minimum_observed_seconds"], 300)
+        self.assertEqual(observed["maximum_observed_seconds"], 900)
+        self.assertFalse(observed["guaranteed"])
+        fallback = cadence_simulator.estimate_workflow_interval([])
+        self.assertEqual(fallback["seconds"], 300)
+        self.assertEqual(fallback["source"], "cron_fallback_no_observed_gap")
+
+    def test_overlapping_workflow_uses_longer_cycle_and_marks_clearance_unreliable(self):
+        row = next(item for item in cadence_simulator.simulate_intervals(
+            queue_depth=100, available_seconds=540, next_run_seconds=300,
+            workflow_nonpublishing_seconds=180,
+        ) if item["interval_seconds"] == 30)
+        self.assertTrue(row["workflow_duration_exceeds_assumption"])
+        self.assertGreaterEqual(row["effective_cycle_seconds"], row["estimated_workflow_seconds"])
+        self.assertFalse(row["clearance_forecast_reliable"])
+        self.assertEqual(row["clearance_forecast_quality"], "faible_chevauchement")
+
+    def test_collection_time_is_not_counted_as_time_since_last_success_at_next_run(self):
+        after_publication = next(item for item in cadence_simulator.simulate_intervals(
+            queue_depth=100, available_seconds=540, next_run_seconds=300,
+            workflow_nonpublishing_seconds=400,
+        ) if item["interval_seconds"] == 30)
+        self.assertTrue(after_publication["workflow_duration_exceeds_assumption"])
+        self.assertEqual(after_publication["first_wait_next_run_seconds"], 30)
+        self.assertEqual(after_publication["capacity_next_run"], 10)
+
+        without_publication = next(item for item in cadence_simulator.simulate_intervals(
+            queue_depth=100, available_seconds=100, next_run_seconds=300,
+            workflow_nonpublishing_seconds=400,
+            seconds_since_last_success=0,
+        ) if item["interval_seconds"] == 30)
+        self.assertEqual(without_publication["capacity_this_run"], 0)
+        self.assertEqual(without_publication["first_wait_next_run_seconds"], 30)
+
+    def test_arrivals_can_prevent_queue_clearance_and_saturation_is_reported(self):
+        row = next(item for item in cadence_simulator.simulate_intervals(
+            queue_depth=100, available_seconds=720, arrivals_per_minute=20,
+            next_run_seconds=300,
+        ) if item["interval_seconds"] == 30)
+        self.assertIsNone(row["estimated_clearance_seconds"])
+        self.assertEqual(row["clearance_status"], "arrivals_at_or_above_service")
+        self.assertGreater(row["projected_queue_before_next_run"], row["queue_after_run"])
+        self.assertGreater(row["effective_cycle_seconds"], row["assumed_start_interval_seconds"])
+        self.assertGreater(row["incoming_before_next_run"], 100)
+
+    def test_insufficient_execution_budget_reports_no_clearance_forecast(self):
+        row = next(item for item in cadence_simulator.simulate_intervals(
+            queue_depth=10, available_seconds=100,
+            send_budget_floor_seconds=210,
+        ) if item["interval_seconds"] == 10)
+        self.assertEqual(row["capacity_this_run"], 0)
+        self.assertIsNone(row["estimated_clearance_seconds"])
+        self.assertEqual(row["clearance_status"], "budget_insufficient")
+
     def test_request_latency_uses_recent_measurements_and_falls_back_when_missing(self):
         self.assertEqual(cadence_simulator.estimated_send_request_seconds([]), 0.5)
         measured = cadence_simulator.estimated_send_request_seconds([
@@ -51,6 +157,20 @@ class CadenceSimulationTests(unittest.TestCase):
             {"telegram_request_duration_seconds": 0.4, "telegram_attempts": 1},
         ])
         self.assertAlmostEqual(measured, 0.4)
+
+    def test_sender_operation_estimate_includes_retry_waits_measured_by_the_caller(self):
+        measured = cadence_simulator.estimated_send_operation_seconds([
+            {"telegram_call_duration_seconds": 9.0, "telegram_send_operations": 3},
+        ])
+        self.assertEqual(measured, 3.0)
+        self.assertEqual(cadence_simulator.estimated_send_operation_seconds([]), 0.5)
+
+    def test_arrival_rate_uses_admissible_count_when_available(self):
+        rate = cadence_simulator.estimated_arrivals_per_minute([
+            {"run_started_epoch": 100, "articles_discovered": 80, "articles_admissible": 2},
+            {"run_started_epoch": 160, "articles_discovered": 90, "articles_admissible": 3},
+        ])
+        self.assertEqual(rate, 3)
 
     def test_light_queue_keeps_comfortable_simulated_cadence(self):
         result = cadence_simulator.build_simulation(
@@ -216,8 +336,62 @@ class CadenceSimulationTests(unittest.TestCase):
         self.assertEqual(state["file"][0]["pub"], "2001-01-01")
         self.assertEqual(poster._oldest_pending_age_seconds(state["file"], now_epoch=1017), 17)
         self.assertEqual(metrics["articles_discovered"], 1)
+        self.assertEqual(metrics["articles_admissible"], 1)
         self.assertEqual(metrics["articles_added"], 1)
         self.assertEqual(metrics["queue_max"], 1)
+        self.assertFalse(metrics["freshness_policy_enabled"])
+        self.assertEqual(metrics["articles_rejected_by_freshness"], 0)
+        self.assertEqual(metrics["articles_with_pubdate"], 1)
+
+    def test_metrics_separate_feed_cursor_skips_id_duplicates_and_admissions(self):
+        feed = "https://example.org/feed"
+        entries = [
+            {"id": "new", "title": "New", "link": "https://example.org/new"},
+            {"id": "dup", "title": "Dup", "link": "https://example.org/dup"},
+            {"id": "cursor", "title": "Cursor", "link": "https://example.org/cursor"},
+        ]
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        state = {
+            "vus": ["dup"], "file": [], "feeds": [feed], "yt": {}, "init": True,
+            "feed_health": {feed: {"latest_uid": "cursor"}},
+        }
+        metrics = {}
+        poster.collect_articles(
+            [feed], state, http=Mock(get=Mock(return_value=response)),
+            parser=Mock(return_value=Mock(entries=entries)), metrics=metrics,
+            queue_clock=lambda: 1000,
+        )
+        self.assertEqual(metrics["entries_examined"], 3)
+        self.assertEqual(metrics["articles_skipped_by_feed_cursor"], 1)
+        self.assertEqual(metrics["articles_skipped_by_seen_id"], 1)
+        self.assertEqual(metrics["articles_discovered"], 1)
+        self.assertEqual(metrics["articles_admissible"], 1)
+        self.assertEqual(metrics["articles_added"], 1)
+        self.assertFalse(metrics["freshness_policy_enabled"])
+
+    def test_full_queue_counts_admissible_article_without_counting_it_as_added(self):
+        feed = "https://example.org/feed"
+        entry = {"id": "deferred", "title": "Deferred", "link": "https://example.org/deferred"}
+        response = Mock(content=b"<rss/>")
+        response.raise_for_status.return_value = None
+        state = {
+            "vus": [],
+            "file": [{"text": "occupied", "link": "https://example.org/occupied"}]
+                * poster.MAX_FILE,
+            "feeds": [feed], "yt": {}, "init": True,
+        }
+        metrics = {}
+        poster.collect_articles(
+            [feed], state, http=Mock(get=Mock(return_value=response)),
+            parser=Mock(return_value=Mock(entries=[entry])), metrics=metrics,
+        )
+        self.assertEqual(metrics["articles_discovered"], 1)
+        self.assertEqual(metrics["articles_admissible"], 1)
+        self.assertEqual(metrics["articles_added"], 0)
+        self.assertEqual(metrics["rss_deferred"], 1)
+        self.assertNotIn("deferred", state["vus"])
+        self.assertEqual(len(state["file"]), poster.MAX_FILE)
 
     def test_run_metrics_history_stays_bounded_and_contains_no_article_content(self):
         state = {"metrics_history": []}

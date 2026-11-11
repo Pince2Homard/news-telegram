@@ -310,8 +310,16 @@ def _store_run_metrics(state, metrics):
     state["metrics_history"] = (history + [{
         "run_started_epoch": round(metrics["run_started_epoch"], 3),
         "feeds_examined": metrics.get("feeds_examined", 0),
+        "entries_examined": metrics.get("entries_examined", 0),
         "articles_discovered": metrics.get("articles_discovered", 0),
+        "articles_admissible": metrics.get("articles_admissible", 0),
         "articles_added": metrics.get("articles_added", 0),
+        "articles_rejected_by_freshness": metrics.get("articles_rejected_by_freshness", 0),
+        "articles_skipped_by_seen_id": metrics.get("articles_skipped_by_seen_id", 0),
+        "articles_skipped_by_feed_cursor": metrics.get("articles_skipped_by_feed_cursor", 0),
+        "articles_with_pubdate": metrics.get("articles_with_pubdate", 0),
+        "articles_without_pubdate": metrics.get("articles_without_pubdate", 0),
+        "freshness_policy_enabled": metrics.get("freshness_policy_enabled", False),
         "published": metrics.get("published", 0),
         "rss_deferred": metrics.get("rss_deferred", 0),
         "queue_initial": metrics.get("queue_initial", 0),
@@ -323,6 +331,8 @@ def _store_run_metrics(state, metrics):
         "intervals_seconds": metrics.get("intervals_seconds", []),
         "telegram_attempts": metrics.get("telegram_attempts", 0),
         "telegram_request_duration_seconds": metrics.get("telegram_request_duration_seconds", 0),
+        "telegram_send_operations": metrics.get("telegram_send_operations", 0),
+        "telegram_call_duration_seconds": metrics.get("telegram_call_duration_seconds", 0),
         "simulated_interval_seconds": metrics.get("simulation", {})
             .get("recommendation", {}).get("interval_seconds", 30),
         "simulated_candidate_interval_seconds": metrics.get("simulation", {})
@@ -368,8 +378,14 @@ def collect_articles(
         ordered_feeds = []
         state["feed_offset"] = 0
     started = clock()
-    counts = {"ok": 0, "empty": 0, "error": 0, "http_error": 0, "deferred_feeds": 0,
-              "discovered": 0, "added": 0, "deferred": 0, "attempted": 0}
+    counts = {
+        "ok": 0, "empty": 0, "error": 0, "http_error": 0,
+        "deferred_feeds": 0, "entries_examined": 0,
+        "discovered": 0, "admissible": 0, "added": 0,
+        "deferred": 0, "freshness_rejected": 0, "invalid_link": 0,
+        "duplicate_id": 0, "cursor_skipped": 0,
+        "pubdate_known": 0, "pubdate_unknown": 0, "attempted": 0,
+    }
     for index, url in enumerate(ordered_feeds):
         if clock() - started >= budget:
             break
@@ -408,6 +424,7 @@ def collect_articles(
             continue
 
         is_new_feed = url not in state["feeds"]
+        counts["entries_examined"] += len(entries)
         if entries:
             counts["ok"] += 1
         else:
@@ -442,13 +459,16 @@ def collect_articles(
             # Les entrées antérieures au curseur ont déjà été parcourues, même
             # si leur ID a été éjecté de la fenêtre globale des 5 000 vus.
             if cursor_index >= 0 and entry_index < cursor_index:
+                counts["cursor_skipped"] += 1
                 continue
             if cursor_index >= 0 and entry_index == cursor_index:
+                counts["cursor_skipped"] += 1
                 if not blocked_cursor:
                     current_cursor = uid
                 continue
 
             if uid in seen:
+                counts["duplicate_id"] += 1
                 if not blocked_cursor:
                     current_cursor = uid
                 continue
@@ -456,6 +476,7 @@ def collect_articles(
             # Ne marquer comme vu qu'un article dont le lien est publiable.
             item = format_item(entry)
             if item is None:
+                counts["invalid_link"] += 1
                 print("Article ignoré : lien HTTP(S) absent ou invalide.")
                 blocked_cursor = True
                 continue
@@ -468,6 +489,13 @@ def collect_articles(
                 continue
 
             counts["discovered"] += 1
+            # Le filtre de fraîcheur sera inséré ici lors d'une phase future.
+            # Il est actuellement inactif : tout candidat valide est admissible.
+            counts["admissible"] += 1
+            if item["pub"]:
+                counts["pubdate_known"] += 1
+            else:
+                counts["pubdate_unknown"] += 1
 
             # Ne pas faire croître la file sans limite : un article non ajouté
             # n'est pas marqué comme vu et sera réessayé au passage suivant.
@@ -518,7 +546,9 @@ def collect_articles(
         "| ok:", counts["ok"], "| vides:", counts["empty"],
         "| erreurs:", counts["error"], "| erreurs HTTP:", counts["http_error"],
         "| flux avec reports:", counts["deferred_feeds"],
-        "| découverts:", counts["discovered"], "| ajoutés:", counts["added"],
+        "| entrées examinées:", counts["entries_examined"],
+        "| découverts:", counts["discovered"],
+        "| admissibles:", counts["admissible"], "| ajoutés:", counts["added"],
         "| reportés:", counts["deferred"], "| durée:", collection_duration, "s",
         "| défaillances récurrentes:", ", ".join(recurrent) if recurrent else "aucune",
     )
@@ -528,8 +558,17 @@ def collect_articles(
         metrics.update({
             "feeds_total": len(ordered_feeds),
             "feeds_examined": counts["attempted"],
+            "entries_examined": counts["entries_examined"],
             "articles_discovered": counts["discovered"],
+            "articles_admissible": counts["admissible"],
             "articles_added": counts["added"],
+            "articles_rejected_by_freshness": counts["freshness_rejected"],
+            "articles_skipped_by_seen_id": counts["duplicate_id"],
+            "articles_skipped_by_feed_cursor": counts["cursor_skipped"],
+            "articles_invalid_link": counts["invalid_link"],
+            "articles_with_pubdate": counts["pubdate_known"],
+            "articles_without_pubdate": counts["pubdate_unknown"],
+            "freshness_policy_enabled": False,
             "rss_deferred": counts["deferred"],
             "rss_errors": counts["error"],
             "rss_http_errors": counts["http_error"],
@@ -676,6 +715,7 @@ def process_queue(
     sent = 0
     cadence_wait_seconds = 0.0
     telegram_errors = 0
+    telegram_send_operations = 0
     telegram_attempts = 0
     telegram_attempt_errors = 0
     telegram_http_errors = 0
@@ -740,6 +780,7 @@ def process_queue(
 
         item = state["file"][0]
         call_started = monotonic()
+        telegram_send_operations += 1
         try:
             outcome = sender(item, token, chat_id)
         except GlobalTelegramError as exc:
@@ -842,6 +883,7 @@ def process_queue(
             "publication_seconds": publication_duration,
             "cadence_wait_seconds": round(cadence_wait_seconds, 3),
             "telegram_errors": telegram_errors,
+            "telegram_send_operations": telegram_send_operations,
             "telegram_attempts": telegram_attempts,
             "telegram_attempt_errors": telegram_attempt_errors,
             "telegram_http_errors": telegram_http_errors,
@@ -851,21 +893,6 @@ def process_queue(
             "next_publication_allowed_utc": _utc_iso(next_allowed) if next_allowed is not None else None,
         })
     return sent
-
-
-def _estimated_next_run_seconds(history, fallback=300.0):
-    starts = [
-        record.get("run_started_epoch") for record in history
-        if isinstance(record, dict)
-        and isinstance(record.get("run_started_epoch"), (int, float))
-        and not isinstance(record.get("run_started_epoch"), bool)
-    ][-6:]
-    gaps = [right - left for left, right in zip(starts, starts[1:]) if right > left]
-    if not gaps:
-        return fallback
-    ordered = sorted(gaps)
-    middle = len(ordered) // 2
-    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
 
 
 def _previous_simulation(history):
@@ -920,9 +947,9 @@ def main():
     available_for_publication = max(0.0, RUN_BUDGET - (time.monotonic() - run_started))
     oldest_age_before = _oldest_pending_age_seconds(state["file"])
     previous_success = state.get("last_successful_send_at")
-    simulated_wait = (
-        max(0.0, previous_success + interval_seconds - time.time())
-        if previous_success is not None else 0.0
+    seconds_since_last_success = (
+        max(0.0, time.time() - previous_success)
+        if previous_success is not None else None
     )
     metrics["oldest_pending_age_before_publication_seconds"] = oldest_age_before
     metrics["simulation"] = cadence_simulator.build_simulation(
@@ -932,13 +959,21 @@ def main():
         available_seconds=available_for_publication,
         run_started_epoch=run_started_epoch,
         articles_discovered=metrics.get("articles_discovered", 0),
+        articles_admissible=metrics.get("articles_admissible", 0),
         previous_simulation=_previous_simulation(history),
-        next_run_seconds=_estimated_next_run_seconds(history),
+        next_run_seconds=300.0,
+        workflow_nonpublishing_seconds=(
+            metrics.get("collection_seconds", 0)
+            + cadence_simulator.estimated_nonpublishing_seconds(history)
+        ),
         send_budget_floor_seconds=MAX_TELEGRAM_SEND_BUDGET_SECONDS,
-        initial_wait_seconds=simulated_wait,
+        seconds_since_last_success=seconds_since_last_success,
         max_per_run=MAX_PAR_RUN,
         max_queue=MAX_FILE,
         send_request_seconds=cadence_simulator.estimated_send_request_seconds(
+            history, fallback=DEFAULT_ESTIMATED_SEND_SECONDS,
+        ),
+        send_operation_seconds=cadence_simulator.estimated_send_operation_seconds(
             history, fallback=DEFAULT_ESTIMATED_SEND_SECONDS,
         ),
     )
@@ -955,6 +990,7 @@ def main():
             "publication_seconds": 0.0,
             "cadence_wait_seconds": 0.0,
             "telegram_errors": 0,
+            "telegram_send_operations": 0,
             "telegram_attempts": 0,
             "telegram_attempt_errors": 0,
             "telegram_http_errors": 0,

@@ -673,15 +673,18 @@ class PosterSafetyTests(unittest.TestCase):
                 response = Mock(ok=False, status_code=status, text="global Telegram error")
                 transport = Mock()
                 transport.post.return_value = response
+                metrics = {}
                 def sender(item, token, chat):
                     return poster.send_message(item, token, chat, http=transport)
                 sent = poster.process_queue(
                     state, {}, "token", "chat", state_path=path, dry_run=False,
-                    sender=sender,
+                    sender=sender, metrics=metrics,
                 )
                 self.assertEqual(sent, 0)
                 self.assertEqual(state["file"], items)
                 self.assertEqual(state["erreurs"], [])
+                self.assertEqual(metrics["telegram_send_operations"], 1)
+                self.assertEqual(metrics["telegram_attempts"], 1)
                 saved = json.loads(Path(path).read_text())
                 self.assertEqual(saved["file"], items)
                 self.assertEqual(saved["erreurs"], [])
