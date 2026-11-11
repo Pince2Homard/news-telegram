@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       send_test_message:
-        description: "Envoyer UN message au canal de test (branche hardening uniquement)"
+        description: "Envoyer UN message au canal de test (branche phase-3 uniquement)"
         required: true
         type: boolean
         default: false
@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   dry-run:
-    if: github.ref == 'refs/heads/hardening/phase-1'
+    if: github.ref == 'refs/heads/hardening/phase-3-maintenance'
     runs-on: ubuntu-latest
     timeout-minutes: 14
     steps:
@@ -39,7 +39,7 @@ jobs:
           STATE_FILE: state.json
           FEEDS_FILE: feeds.txt
       - name: Envoyer un unique message de contrôle au canal de test
-        if: inputs.send_test_message == true && github.ref == 'refs/heads/hardening/phase-1'
+        if: inputs.send_test_message == true && github.ref == 'refs/heads/hardening/phase-3-maintenance'
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
