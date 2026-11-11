@@ -61,6 +61,10 @@ Les tests utilisent des transports simulés et ne publient aucun message Telegra
 - Les erreurs Telegram définitives sont conservées dans la liste `erreurs`, limitée à 500 entrées.
 - Les flux YouTube par identifiant de chaîne utilisent directement le flux RSS public YouTube. L'ancien format GDATA reste pris en charge par compatibilité.
 - Les journaux de collecte donnent une durée et un résumé par flux. Les erreurs HTTP précisent le statut, une catégorie générale et le délai `Retry-After` numérique s'il existe ; les erreurs récurrentes sont suivies dans l'état. Les identifiants de journal n'exposent pas les paramètres d'URL.
+- Chaque exécution émet aussi une ligne JSON `PHASE51_METRICS` avec le volume RSS, les ajouts, les publications, les reports, les tailles de file, les durées, les erreurs, les intervalles observés et l'âge de la tête de file quand il est connu. Les anciennes entrées sans `queued_at` conservent leur contenu et affichent un âge inconnu : la date RSS n'est jamais utilisée comme date d'entrée en file.
+- `state.json` conserve au plus 12 petits résumés d'exécution, sans titre, URL, identifiant Telegram ni secret. Les nouveaux articles reçoivent un timestamp `queued_at`; aucune donnée de mise en file n'est inventée pour les articles déjà présents.
+- Le module `cadence_simulator.py` compare 30, 25, 20, 15 et 10 secondes, estime le débit par passage, la file projetée, le risque de saturation et le temps de résorption. L'estimation utilise les derniers résumés disponibles et le budget restant du workflow. Une hystérésis attend deux observations avant de changer la recommandation, puis avance d'un seul palier de 5 secondes par validation. En l'absence d'historique suffisant, la simulation garde 30 secondes.
+- La recommandation de cadence reste uniquement informative en phase 5.1. Elle n'est jamais transmise à la file Telegram. La cadence effective demeure `TELEGRAM_INTERVAL_SECONDS` (30 secondes par défaut, ou la valeur explicite configurée). Le simulateur n'appelle ni réseau ni fonction d'envoi.
 
 ### Limites de la planification
 

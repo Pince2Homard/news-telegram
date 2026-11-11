@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 import feedparser
 import requests
+import cadence_simulator
 
 DEFAULT_TELEGRAM_INTERVAL_SECONDS = 30
 MAX_INLINE_CADENCE_WAIT_SECONDS = 120
@@ -30,6 +31,8 @@ MAX_FILE = 1000
 COLLECT_BUDGET = 180
 RUN_BUDGET = 12 * 60
 CHECKPOINT_EVERY = 5
+MAX_METRICS_HISTORY = 12
+DEFAULT_ESTIMATED_SEND_SECONDS = 0.5
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
 GDATA = re.compile(r"https?://gdata\.youtube\.com/feeds/base/users/([^/]+)/uploads")
 MOTIFS = [
@@ -50,9 +53,17 @@ def load_feeds(path="feeds.txt"):
 class PermanentTelegramError(Exception):
     """Erreur Telegram propre à un article : l’article ne pourra pas être envoyé tel quel."""
 
+    def __init__(self, message, http_status=None):
+        super().__init__(message)
+        self.http_status = http_status
+
 
 class GlobalTelegramError(Exception):
     """Erreur de configuration ou d’accès Telegram : toute la file doit être préservée."""
+
+    def __init__(self, message, http_status=None):
+        super().__init__(message)
+        self.http_status = http_status
 
 
 @dataclass(frozen=True)
@@ -62,6 +73,10 @@ class TelegramSendResult:
     success: bool
     message_id: int | str | None = None
     telegram_date: float | None = None
+    attempts: int = 1
+    attempt_errors: int = 0
+    duration_seconds: float = 0.0
+    http_errors: int = 0
 
     def __bool__(self):
         return self.success
@@ -139,6 +154,7 @@ def load_state(path="state.json"):
     state.setdefault("feed_offset", 0)
     state.setdefault("last_successful_send_at", None)
     state.setdefault("last_successful_message_id", None)
+    state.setdefault("metrics_history", [])
     if (not isinstance(state["vus"], list) or not isinstance(state["file"], list)
             or not isinstance(state["erreurs"], list)):
         raise ValueError("Format invalide dans state.json : listes 'vus', 'file' et 'erreurs' requises")
@@ -146,6 +162,8 @@ def load_state(path="state.json"):
         raise ValueError("Format invalide dans state.json : 'feeds' ou 'yt'")
     if not isinstance(state["feed_health"], dict):
         raise ValueError("Format invalide dans state.json : 'feed_health'")
+    if not isinstance(state["metrics_history"], list):
+        raise ValueError("Format invalide dans state.json : 'metrics_history'")
     if not isinstance(state["feed_offset"], int):
         raise ValueError("Format invalide dans state.json : 'feed_offset'")
     last_send = state["last_successful_send_at"]
@@ -274,16 +292,64 @@ def _feed_label(url):
     return f"{host}#{fingerprint}"
 
 
+def _oldest_pending_age_seconds(queue, now_epoch=None):
+    """Âge depuis la mise en file, jamais depuis la date RSS."""
+    if not queue or not isinstance(queue[0], dict):
+        return None
+    queued_at = queue[0].get("queued_at")
+    if (isinstance(queued_at, bool) or not isinstance(queued_at, (int, float))
+            or not math.isfinite(queued_at) or queued_at < 0):
+        return None
+    now = time.time() if now_epoch is None else float(now_epoch)
+    return round(max(0.0, now - queued_at), 3)
+
+
+def _store_run_metrics(state, metrics):
+    """Garde un petit historique borné, sans article, URL ni donnée secrète."""
+    history = state.setdefault("metrics_history", [])
+    state["metrics_history"] = (history + [{
+        "run_started_epoch": round(metrics["run_started_epoch"], 3),
+        "feeds_examined": metrics.get("feeds_examined", 0),
+        "articles_discovered": metrics.get("articles_discovered", 0),
+        "articles_added": metrics.get("articles_added", 0),
+        "published": metrics.get("published", 0),
+        "rss_deferred": metrics.get("rss_deferred", 0),
+        "queue_initial": metrics.get("queue_initial", 0),
+        "queue_final": metrics.get("queue_final", 0),
+        "oldest_pending_age_seconds": metrics.get("oldest_pending_age_seconds"),
+        "collection_seconds": metrics.get("collection_seconds", 0),
+        "publication_seconds": metrics.get("publication_seconds", 0),
+        "total_seconds": metrics.get("total_seconds", 0),
+        "intervals_seconds": metrics.get("intervals_seconds", []),
+        "simulated_interval_seconds": metrics.get("simulation", {})
+            .get("recommendation", {}).get("interval_seconds", 30),
+        "simulated_candidate_interval_seconds": metrics.get("simulation", {})
+            .get("recommendation", {}).get("candidate_interval_seconds"),
+        "simulated_candidate_observations": metrics.get("simulation", {})
+            .get("recommendation", {}).get("candidate_observations", 0),
+    }])[-MAX_METRICS_HISTORY:]
+
+
+def _log_phase51_metrics(metrics):
+    """Résumé JSON compact, sans URL de flux, token, chat ni identifiant de message."""
+    print(
+        "PHASE51_METRICS |",
+        json.dumps(metrics, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+    )
+
+
 def collect_articles(
     feeds, state, http=requests, parser=feedparser.parse,
     budget=COLLECT_BUDGET, clock=time.monotonic, checkpoint=None,
-    checkpoint_every=CHECKPOINT_EVERY,
+    checkpoint_every=CHECKPOINT_EVERY, metrics=None, queue_clock=time.time,
 ):
     state.setdefault("feed_health", {})
     state.setdefault("feeds", [])
     state.setdefault("file", [])
     state.setdefault("vus", [])
     state.setdefault("yt", {})
+    queue_initial = len(state["file"])
+    queue_max = queue_initial
     seen = dict.fromkeys(state["vus"])
     # Les états historiques sans init mais avec de l’activité sont déjà en service.
     was_initialized = (
@@ -300,7 +366,7 @@ def collect_articles(
         ordered_feeds = []
         state["feed_offset"] = 0
     started = clock()
-    counts = {"ok": 0, "empty": 0, "error": 0, "deferred_feeds": 0,
+    counts = {"ok": 0, "empty": 0, "error": 0, "http_error": 0, "deferred_feeds": 0,
               "discovered": 0, "added": 0, "deferred": 0, "attempted": 0}
     for index, url in enumerate(ordered_feeds):
         if clock() - started >= budget:
@@ -318,6 +384,8 @@ def collect_articles(
             health["last_error"] = type(exc).__name__
             error_duration = round(clock() - feed_started, 3)
             status = _http_status_from_exception(exc)
+            if status is not None:
+                counts["http_error"] += 1
             retry_after = _retry_after_seconds(exc)
             health["last_http_status"] = status
             health["last_error_category"] = _http_status_category(status)
@@ -408,9 +476,11 @@ def collect_articles(
                 continue
 
             seen[uid] = None
+            item["queued_at"] = float(queue_clock())
             state["file"].append(item)
             counts["added"] += 1
             feed_added += 1
+            queue_max = max(queue_max, len(state["file"]))
             if not blocked_cursor:
                 current_cursor = uid
 
@@ -440,16 +510,32 @@ def collect_articles(
         _feed_label(url) for url, health in state["feed_health"].items()
         if url in feeds and int(health.get("consecutive_errors", 0)) >= 3
     ]
+    collection_duration = round(clock() - started, 3)
     print(
         "Collecte RSS | flux:", counts["attempted"], "/", len(ordered_feeds),
         "| ok:", counts["ok"], "| vides:", counts["empty"],
-        "| erreurs:", counts["error"], "| flux avec reports:", counts["deferred_feeds"],
+        "| erreurs:", counts["error"], "| erreurs HTTP:", counts["http_error"],
+        "| flux avec reports:", counts["deferred_feeds"],
         "| découverts:", counts["discovered"], "| ajoutés:", counts["added"],
-        "| reportés:", counts["deferred"], "| durée:", round(clock() - started, 3), "s",
+        "| reportés:", counts["deferred"], "| durée:", collection_duration, "s",
         "| défaillances récurrentes:", ", ".join(recurrent) if recurrent else "aucune",
     )
     if checkpoint:
         checkpoint(state, seen)
+    if metrics is not None:
+        metrics.update({
+            "feeds_total": len(ordered_feeds),
+            "feeds_examined": counts["attempted"],
+            "articles_discovered": counts["discovered"],
+            "articles_added": counts["added"],
+            "rss_deferred": counts["deferred"],
+            "rss_errors": counts["error"],
+            "rss_http_errors": counts["http_error"],
+            "queue_initial": queue_initial,
+            "queue_max": queue_max,
+            "queue_after_collection": len(state["file"]),
+            "collection_seconds": collection_duration,
+        })
     return seen
 
 
@@ -457,6 +543,9 @@ def send_message(
     item, token, chat_id, http=requests, sleep=time.sleep,
     monotonic=time.monotonic, clock=time.time,
 ):
+    attempt_errors = 0
+    http_errors = 0
+    request_duration = 0.0
     for attempt in range(TELEGRAM_MAX_ATTEMPTS):
         attempt_at = clock()
         request_started = monotonic()
@@ -470,16 +559,24 @@ def send_message(
             # Résultat ambigu : Telegram a peut-être reçu le message.
             # Ne pas réessayer automatiquement pour éviter un doublon immédiat.
             duration = max(0, monotonic() - request_started)
+            request_duration += duration
+            attempt_errors += 1
             status = _http_status_from_exception(exc)
+            if status is not None:
+                http_errors += 1
             print(
                 "TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
                 "| tentative:", f"{attempt + 1}/{TELEGRAM_MAX_ATTEMPTS}",
                 "| résultat: réseau_ambigu | HTTP:", status if status is not None else "n/a",
                 "| durée_s:", round(duration, 3), "| erreur:", type(exc).__name__,
             )
-            return TelegramSendResult(False)
+            return TelegramSendResult(
+                False, attempts=attempt + 1, attempt_errors=attempt_errors,
+                duration_seconds=request_duration, http_errors=http_errors,
+            )
 
         duration = max(0, monotonic() - request_started)
+        request_duration += duration
         status = getattr(response, "status_code", None)
         if response.ok:
             message_id = None
@@ -507,9 +604,14 @@ def send_message(
                 "| confirmé_utc:", _utc_iso(confirmed_at),
                 "| message_id:", message_id if message_id is not None else "indisponible",
             )
-            return TelegramSendResult(True, message_id, telegram_date)
+            return TelegramSendResult(
+                True, message_id, telegram_date, attempt + 1,
+                attempt_errors, request_duration, http_errors,
+            )
 
         if status == 429:
+            attempt_errors += 1
+            http_errors += 1
             try:
                 wait = int(response.json()["parameters"]["retry_after"])
             except (KeyError, TypeError, ValueError):
@@ -525,6 +627,9 @@ def send_message(
             continue
 
         message = f"HTTP {status}"
+        if status is not None:
+            http_errors += 1
+        attempt_errors += 1
         print(
             "TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
             "| tentative:", f"{attempt + 1}/{TELEGRAM_MAX_ATTEMPTS}",
@@ -533,18 +638,24 @@ def send_message(
             "| durée_s:", round(duration, 3),
         )
         if status in (401, 403):
-            raise GlobalTelegramError(message)
+            raise GlobalTelegramError(message, http_status=status)
         if isinstance(status, int) and 400 <= status < 500:
-            raise PermanentTelegramError(message)
-        return TelegramSendResult(False)
-    return TelegramSendResult(False)
+            raise PermanentTelegramError(message, http_status=status)
+        return TelegramSendResult(
+            False, attempts=attempt + 1, attempt_errors=attempt_errors,
+            duration_seconds=request_duration, http_errors=http_errors,
+        )
+    return TelegramSendResult(
+        False, attempts=TELEGRAM_MAX_ATTEMPTS, attempt_errors=attempt_errors,
+        duration_seconds=request_duration, http_errors=http_errors,
+    )
 
 
 def process_queue(
     state, seen, token, chat_id, state_path="state.json", dry_run=True,
     sender=send_message, sleep=time.sleep, max_per_run=MAX_PAR_RUN,
     interval_seconds=None, time_limit=11 * 60, clock=time.time,
-    monotonic=time.monotonic,
+    monotonic=time.monotonic, metrics=None,
 ):
     if dry_run:
         print("DRY-RUN : aucune requête Telegram et aucune sauvegarde.")
@@ -559,7 +670,16 @@ def process_queue(
     # La file et les identifiants sont persistés avant toute tentative d'envoi.
     save_state(state, seen, state_path)
     started = monotonic()
+    queue_before = len(state["file"])
     sent = 0
+    cadence_wait_seconds = 0.0
+    telegram_errors = 0
+    telegram_attempt_errors = 0
+    telegram_http_errors = 0
+    telegram_call_duration = 0.0
+    telegram_request_duration = 0.0
+    successful_intervals = []
+    queue_max = max(queue_before, int((metrics or {}).get("queue_max", 0)))
     last_success = state.get("last_successful_send_at")
     next_allowed = last_success + interval if last_success is not None else None
     print(
@@ -606,6 +726,7 @@ def process_queue(
                 "| prochaine_publication_utc:", _utc_iso(next_allowed),
             )
             sleep(wait_seconds)
+            cadence_wait_seconds += max(0.0, monotonic() - (started + elapsed))
             if clock() < next_allowed:
                 print(
                     "PUBLICATION REPORTÉE | raison: attente_interrompue",
@@ -615,14 +736,25 @@ def process_queue(
                 break
 
         item = state["file"][0]
+        call_started = monotonic()
         try:
             outcome = sender(item, token, chat_id)
         except GlobalTelegramError as exc:
+            telegram_call_duration += max(0.0, monotonic() - call_started)
+            telegram_errors += 1
+            telegram_attempt_errors += 1
+            if getattr(exc, "http_status", None) is not None:
+                telegram_http_errors += 1
             # Erreur globale d'identifiants/droits : ne jamais mettre les articles
             # en quarantaine. On arrête et conserve la file pour correction.
             print("ARRÊT DE SÉCURITÉ Telegram | file préservée |", exc)
             break
         except PermanentTelegramError as exc:
+            telegram_call_duration += max(0.0, monotonic() - call_started)
+            telegram_errors += 1
+            telegram_attempt_errors += 1
+            if getattr(exc, "http_status", None) is not None:
+                telegram_http_errors += 1
             # Une erreur propre à l'article ne sera pas corrigée par une nouvelle tentative.
             # Isoler l’article défectueux pour ne pas bloquer toute la file.
             state["erreurs"].append({
@@ -631,9 +763,18 @@ def process_queue(
             state["file"].pop(0)
             save_state(state, seen, state_path)
             print("ARTICLE MIS EN QUARANTAINE |", _feed_label(item.get("link", "")), "|", exc)
+            queue_max = max(queue_max, len(state["file"]))
             continue
+        telegram_call_duration += max(0.0, monotonic() - call_started)
+        if isinstance(outcome, TelegramSendResult):
+            telegram_attempt_errors += outcome.attempt_errors
+            telegram_request_duration += outcome.duration_seconds
+            telegram_http_errors += outcome.http_errors
         if not outcome:
             # Résultat ambigu ou erreur temporaire : conserver l'article en tête.
+            telegram_errors += 1
+            if not isinstance(outcome, TelegramSendResult) or not outcome.attempt_errors:
+                telegram_attempt_errors += 1
             break
 
         telegram_date = outcome.telegram_date if isinstance(outcome, TelegramSendResult) else None
@@ -643,6 +784,9 @@ def process_queue(
             # Le champ date Telegram est à la seconde : arrondir prudemment vers
             # le futur pour ne jamais raccourcir l'intervalle minimal.
             successful_at = max(successful_at, telegram_date + 1)
+        previous_success = state.get("last_successful_send_at")
+        if previous_success is not None and successful_at >= previous_success:
+            successful_intervals.append(round(successful_at - previous_success, 3))
         state["file"].pop(0)
         sent += 1
         state["last_successful_send_at"] = successful_at
@@ -659,6 +803,7 @@ def process_queue(
             )
             raise
         next_allowed = successful_at + interval
+        queue_max = max(queue_max, len(state["file"]))
         print(
             "ENVOYÉ | publié:", item.get("pub") or "?",
             "| source:", _feed_label(item["link"]),
@@ -670,6 +815,7 @@ def process_queue(
 
     save_state(state, seen, state_path)
     remaining = state["file"]
+    publication_duration = round(max(0.0, monotonic() - started), 3)
     last_success = state.get("last_successful_send_at")
     next_allowed = last_success + interval if last_success is not None else None
     print(
@@ -678,7 +824,50 @@ def process_queue(
         (remaining[0].get("pub") or "?") if remaining else "-",
         "| prochaine_publication_utc:", _utc_iso(next_allowed) if next_allowed is not None else "immédiate",
     )
+    if metrics is not None:
+        metrics.update({
+            "queue_before_publication": queue_before,
+            "queue_final": len(remaining),
+            "queue_max": max(queue_max, len(remaining)),
+            "published": sent,
+            "publication_deferred": len(remaining),
+            "publication_seconds": publication_duration,
+            "cadence_wait_seconds": round(cadence_wait_seconds, 3),
+            "telegram_errors": telegram_errors,
+            "telegram_attempt_errors": telegram_attempt_errors,
+            "telegram_http_errors": telegram_http_errors,
+            "telegram_call_duration_seconds": round(telegram_call_duration, 3),
+            "telegram_request_duration_seconds": round(telegram_request_duration, 3),
+            "intervals_seconds": successful_intervals,
+            "next_publication_allowed_utc": _utc_iso(next_allowed) if next_allowed is not None else None,
+        })
     return sent
+
+
+def _estimated_next_run_seconds(history, fallback=300.0):
+    starts = [
+        record.get("run_started_epoch") for record in history
+        if isinstance(record, dict)
+        and isinstance(record.get("run_started_epoch"), (int, float))
+        and not isinstance(record.get("run_started_epoch"), bool)
+    ][-6:]
+    gaps = [right - left for left, right in zip(starts, starts[1:]) if right > left]
+    if not gaps:
+        return fallback
+    ordered = sorted(gaps)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def _previous_simulation(history):
+    if not history or not isinstance(history[-1], dict):
+        return None
+    latest = history[-1]
+    return {
+        "interval_seconds": latest.get("simulated_interval_seconds", 30),
+        "candidate_interval_seconds": latest.get("simulated_candidate_interval_seconds"),
+        "candidate_observations": latest.get("simulated_candidate_observations", 0),
+    }
 
 
 def main():
@@ -700,24 +889,88 @@ def main():
             raise RuntimeError("Publication refusée : TELEGRAM_TOKEN et TELEGRAM_CHAT sont requis.")
 
     run_started = time.monotonic()
+    run_started_epoch = time.time()
     feeds = load_feeds(os.getenv("FEEDS_FILE", "feeds.txt"))
     state_path = os.getenv("STATE_FILE", "state.json")
     state = load_state(state_path)
+    history = state.get("metrics_history", [])
+    metrics = {
+        "run_started_utc": _utc_iso(run_started_epoch),
+        "run_started_epoch": run_started_epoch,
+        "telegram_interval_configured_seconds": interval_seconds,
+        "queue_initial": len(state["file"]),
+        "queue_max": len(state["file"]),
+    }
     checkpoint = None if dry_run else lambda current, seen: save_state(current, seen, state_path)
     seen = collect_articles(
         feeds, state, budget=min(COLLECT_BUDGET, RUN_BUDGET), checkpoint=checkpoint,
+        metrics=metrics,
     )
 
     print("FILE D'ATTENTE avant traitement :", len(state["file"]), "article(s)")
+    available_for_publication = max(0.0, RUN_BUDGET - (time.monotonic() - run_started))
+    oldest_age_before = _oldest_pending_age_seconds(state["file"])
+    previous_success = state.get("last_successful_send_at")
+    simulated_wait = (
+        max(0.0, previous_success + interval_seconds - time.time())
+        if previous_success is not None else 0.0
+    )
+    metrics["oldest_pending_age_before_publication_seconds"] = oldest_age_before
+    metrics["simulation"] = cadence_simulator.build_simulation(
+        history=history,
+        queue_depth=len(state["file"]),
+        oldest_age_seconds=oldest_age_before,
+        available_seconds=available_for_publication,
+        run_started_epoch=run_started_epoch,
+        articles_discovered=metrics.get("articles_discovered", 0),
+        previous_simulation=_previous_simulation(history),
+        next_run_seconds=_estimated_next_run_seconds(history),
+        send_request_seconds=DEFAULT_ESTIMATED_SEND_SECONDS,
+        send_budget_floor_seconds=MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+        initial_wait_seconds=simulated_wait,
+        max_per_run=MAX_PAR_RUN,
+        max_queue=MAX_FILE,
+    )
     if dry_run:
-        process_queue(state, seen, None, None, state_path=state_path, dry_run=True)
+        process_queue(
+            state, seen, None, None, state_path=state_path, dry_run=True,
+            interval_seconds=interval_seconds,
+        )
+        metrics.update({
+            "queue_after_publication": len(state["file"]),
+            "queue_final": len(state["file"]),
+            "publication_deferred": len(state["file"]),
+            "published": 0,
+            "publication_seconds": 0.0,
+            "cadence_wait_seconds": 0.0,
+            "telegram_errors": 0,
+            "telegram_attempt_errors": 0,
+            "telegram_http_errors": 0,
+            "telegram_call_duration_seconds": 0.0,
+            "telegram_request_duration_seconds": 0.0,
+            "intervals_seconds": [],
+            "next_publication_allowed_utc": (
+                _utc_iso(previous_success + interval_seconds)
+                if previous_success is not None else None
+            ),
+        })
+        metrics["oldest_pending_age_seconds"] = _oldest_pending_age_seconds(state["file"])
+        metrics["total_seconds"] = round(time.monotonic() - run_started, 3)
+        _log_phase51_metrics(metrics)
         return
 
     remaining = max(0, RUN_BUDGET - (time.monotonic() - run_started))
     process_queue(
         state, seen, token, chat_id, state_path=state_path, dry_run=False,
-        interval_seconds=interval_seconds, time_limit=remaining,
+        interval_seconds=interval_seconds, time_limit=remaining, metrics=metrics,
     )
+    metrics["queue_after_publication"] = metrics.get("queue_final", len(state["file"]))
+    metrics["oldest_pending_age_seconds"] = _oldest_pending_age_seconds(state["file"])
+    metrics["total_seconds"] = round(time.monotonic() - run_started, 3)
+    _store_run_metrics(state, metrics)
+    save_state(state, seen, state_path)
+    metrics["total_seconds"] = round(time.monotonic() - run_started, 3)
+    _log_phase51_metrics(metrics)
 
 
 if __name__ == "__main__":
