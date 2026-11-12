@@ -8,15 +8,16 @@ from unittest.mock import Mock, patch
 
 import requests
 import poster
+from newsbot import collection, persistence, admission, dates, deduplication, metrics as run_metrics, publication, settings
 
 
 TEST_RSS_NOW = 1_800_000_000
-_COLLECT_ARTICLES_RAW = poster.collect_articles
+_COLLECT_ARTICLES_RAW = collection.collect_articles
 
 
 def collect_with_fresh_fixtures(*args, **kwargs):
     """Legacy collection tests model newly published entries unless stated otherwise."""
-    parser = kwargs.get("parser", poster.feedparser.parse)
+    parser = kwargs.get("parser", collection.feedparser.parse)
 
     def parser_with_fresh_default(content):
         parsed = parser(content)
@@ -87,21 +88,21 @@ class PosterSafetyTests(unittest.TestCase):
         process.assert_not_called()
 
     def test_format_item_escapes_html_and_rejects_invalid_urls(self):
-        item = poster.format_item({
+        item = admission.format_item({
             "title": "<script>alert(1)</script>",
             "link": "https://example.org/?a=1&b=2",
         })
         self.assertIn("&lt;script&gt;", item["text"])
         self.assertIn("&amp;", item["text"])
-        self.assertIsNone(poster.format_item({"title": "bad", "link": "javascript:alert(1)"}))
-        self.assertIsNone(poster.format_item({"title": "bad", "link": ""}))
+        self.assertIsNone(admission.format_item({"title": "bad", "link": "javascript:alert(1)"}))
+        self.assertIsNone(admission.format_item({"title": "bad", "link": ""}))
 
     def test_dry_run_never_calls_sender_or_writes_state(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "state.json")
             state = {"vus": [], "file": [{"text": "test", "link": "https://example.org"}]}
             sender = Mock(side_effect=AssertionError("Telegram ne doit jamais être appelé"))
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "fake-token", "fake-chat",
                 state_path=state_path, dry_run=True, sender=sender,
             )
@@ -113,7 +114,7 @@ class PosterSafetyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             state = {"file": [], "feeds": [], "yt": {}, "v": 2}
-            poster.save_state(state, {"one": None, "two": None}, str(path))
+            persistence.save_state(state, {"one": None, "two": None}, str(path))
             loaded = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(loaded["vus"], ["one", "two"])
             self.assertFalse(list(Path(directory).glob("*.tmp")))
@@ -123,7 +124,7 @@ class PosterSafetyTests(unittest.TestCase):
             path = Path(directory) / "state.json"
             path.write_text("{broken", encoding="utf-8")
             with self.assertRaises(json.JSONDecodeError):
-                poster.load_state(str(path))
+                persistence.load_state(str(path))
 
     def test_state_migration_preserves_pending_queue(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -133,7 +134,7 @@ class PosterSafetyTests(unittest.TestCase):
                 "pub": "", "queued_at": 123, "first_seen_at": 100,
             }]
             path.write_text(json.dumps({"vus": ["old"], "file": pending, "feeds": ["feed"], "v": 1}))
-            migrated = poster.load_state(str(path))
+            migrated = persistence.load_state(str(path))
             self.assertEqual(migrated["v"], 2)
             self.assertEqual(migrated["file"], pending)
             self.assertEqual(migrated["feeds"], ["feed"])
@@ -363,12 +364,12 @@ class PosterSafetyTests(unittest.TestCase):
     def test_tracking_and_unknown_query_parameters_are_not_discarded(self):
         base = "https://example.org/story?id=7"
         self.assertNotEqual(
-            poster._canonical_url_fingerprint(base + "&utm_source=rss"),
-            poster._canonical_url_fingerprint(base + "&utm_source=web"),
+            deduplication._canonical_url_fingerprint(base + "&utm_source=rss"),
+            deduplication._canonical_url_fingerprint(base + "&utm_source=web"),
         )
         self.assertNotEqual(
-            poster._canonical_url_fingerprint(base + "&edition=morning"),
-            poster._canonical_url_fingerprint(base + "&edition=evening"),
+            deduplication._canonical_url_fingerprint(base + "&edition=morning"),
+            deduplication._canonical_url_fingerprint(base + "&edition=evening"),
         )
 
     def test_url_shaped_legacy_guid_does_not_hide_a_distinct_article(self):
@@ -397,14 +398,14 @@ class PosterSafetyTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            poster.save_state(state, state["vus"], str(path))
-            resumed = poster.load_state(str(path))
+            persistence.save_state(state, state["vus"], str(path))
+            resumed = persistence.load_state(str(path))
             _COLLECT_ARTICLES_RAW(
                 [], resumed, queue_clock=lambda: TEST_RSS_NOW,
                 max_age_seconds=24 * 3600,
             )
         self.assertIn(protected_hash, resumed["url_seen"])
-        self.assertEqual(len(resumed["url_seen"]), poster.MAX_URL_SEEN)
+        self.assertEqual(len(resumed["url_seen"]), settings.MAX_URL_SEEN)
 
     def test_reordered_feed_still_discovers_a_fresh_entry_before_its_cursor(self):
         feed = "https://example.org/feed"
@@ -452,8 +453,7 @@ class PosterSafetyTests(unittest.TestCase):
                 "first_seen_at": TEST_RSS_NOW - 1, "admitted_at": TEST_RSS_NOW - 1,
             }],
         }
-        with patch.object(poster, "MAX_FILE", 1), patch.object(
-            poster, "MAX_ADMISSION_BUFFER", 1,
+        with patch.object(admission, "MAX_FILE", 1), patch.object(admission, "MAX_ADMISSION_BUFFER", 1,
         ):
             state, seen, _ = self.collect_entries([candidate], state=state)
         self.assertNotIn("not-stored", seen)
@@ -477,7 +477,7 @@ class PosterSafetyTests(unittest.TestCase):
             "date_quarantine": [existing],
             "feed_health": {feed: {"consecutive_errors": 0, "latest_uid": "prior"}},
         }
-        with patch.object(poster, "MAX_DATE_QUARANTINE", 1):
+        with patch.object(admission, "MAX_DATE_QUARANTINE", 1):
             state, seen, _ = self.collect_entries([entry], state=state)
         self.assertNotIn("quarantine-overflow", seen)
         self.assertEqual(state["feed_health"][feed]["latest_uid"], "prior")
@@ -499,7 +499,7 @@ class PosterSafetyTests(unittest.TestCase):
             "vus": [], "file": [], "feeds": [feed], "yt": {}, "init": True,
             "date_quarantine": [expired],
         }
-        with patch.object(poster, "MAX_DATE_QUARANTINE", 1):
+        with patch.object(admission, "MAX_DATE_QUARANTINE", 1):
             state, seen, _ = self.collect_entries([candidate], state=state)
         self.assertEqual([record["uid"] for record in state["date_quarantine"]], ["new-unknown"])
         self.assertIn("expired-unknown", seen)
@@ -513,7 +513,7 @@ class PosterSafetyTests(unittest.TestCase):
             "feeds": [feed], "yt": {}, "init": True,
             "date_quarantine": [{
                 "uid": "wait-for-capacity",
-                "url_hash": poster._canonical_url_fingerprint(
+                "url_hash": deduplication._canonical_url_fingerprint(
                     "https://example.org/wait-for-capacity",
                 ),
                 "item": {
@@ -523,8 +523,7 @@ class PosterSafetyTests(unittest.TestCase):
                 "published_at": now,
             }],
         }
-        with patch.object(poster, "MAX_FILE", 1), patch.object(
-            poster, "MAX_ADMISSION_BUFFER", 0,
+        with patch.object(admission, "MAX_FILE", 1), patch.object(admission, "MAX_ADMISSION_BUFFER", 0,
         ):
             state, _, _ = self.collect_entries([], state=state, now=now)
             self.assertEqual(state["date_quarantine"][0]["reason"], "admission_deferred")
@@ -548,7 +547,7 @@ class PosterSafetyTests(unittest.TestCase):
                     }, "first_seen_at": TEST_RSS_NOW, "reason": "unknown_date",
                 }],
             }
-            result = poster.process_queue(
+            result = publication.process_queue(
                 state, {}, "unused", "unused",
                 state_path=str(Path(directory) / "state.json"), dry_run=False,
                 sender=sender,
@@ -572,7 +571,7 @@ class PosterSafetyTests(unittest.TestCase):
             ],
         }
         metrics = {}
-        with patch.object(poster, "MAX_FILE", 3):
+        with patch.object(admission, "MAX_FILE", 3):
             _COLLECT_ARTICLES_RAW(
                 [feed], state, http=Mock(get=Mock(return_value=Mock(
                     content=b"<rss/>", raise_for_status=Mock(return_value=None),
@@ -595,8 +594,7 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertEqual(metrics["articles_promoted_from_admission_buffer"], 2)
 
     def test_publication_fills_freed_queue_space_from_admission_buffer(self):
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            poster, "MAX_FILE", 1,
+        with tempfile.TemporaryDirectory() as directory, patch.object(admission, "MAX_FILE", 1,
         ):
             path = str(Path(directory) / "state.json")
             first = {"text": "first", "link": "https://example.org/first", "pub": ""}
@@ -604,7 +602,7 @@ class PosterSafetyTests(unittest.TestCase):
             state = {
                 "vus": [], "file": [first], "admission_buffer": [{
                     "uid": "second-guid",
-                    "url_hash": poster._canonical_url_fingerprint(second["link"]),
+                    "url_hash": deduplication._canonical_url_fingerprint(second["link"]),
                     "item": second, "first_seen_at": 800, "admitted_at": 900,
                 }],
                 "feeds": [], "yt": {}, "v": 2,
@@ -617,7 +615,7 @@ class PosterSafetyTests(unittest.TestCase):
                 return True
 
             metrics = {}
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=sender, sleep=fake_clock.sleep,
                 clock=fake_clock, monotonic=fake_clock, max_per_run=2,
@@ -636,8 +634,7 @@ class PosterSafetyTests(unittest.TestCase):
             "link": "https://example.org/buffered-fresh",
             "published_parsed": time.gmtime(TEST_RSS_NOW),
         }
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            poster, "MAX_FILE", 1,
+        with tempfile.TemporaryDirectory() as directory, patch.object(admission, "MAX_FILE", 1,
         ):
             path = str(Path(directory) / "state.json")
             state = {
@@ -652,11 +649,11 @@ class PosterSafetyTests(unittest.TestCase):
             seen = _COLLECT_ARTICLES_RAW(
                 [feed], state, http=transport, parser=parser,
                 queue_clock=lambda: TEST_RSS_NOW, max_age_seconds=24 * 3600,
-                checkpoint=lambda current, ids: poster.save_state(current, ids, path),
+                checkpoint=lambda current, ids: persistence.save_state(current, ids, path),
             )
             self.assertIn("buffered-fresh", seen)
             self.assertEqual(len(state["admission_buffer"]), 1)
-            resumed = poster.load_state(path)
+            resumed = persistence.load_state(path)
             resumed["file"].clear()  # Simule la confirmation et sauvegarde de l’article précédent.
             _COLLECT_ARTICLES_RAW(
                 [feed], resumed, http=transport, parser=Mock(return_value=Mock(entries=[])),
@@ -695,12 +692,12 @@ class PosterSafetyTests(unittest.TestCase):
 
     def test_configured_article_freshness_window_is_positive_and_defaults_to_24_hours(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(poster.get_article_max_age_seconds(), 24 * 3600)
+            self.assertEqual(settings.get_article_max_age_seconds(), 24 * 3600)
         with patch.dict(os.environ, {"ARTICLE_MAX_AGE_HOURS": "12"}, clear=True):
-            self.assertEqual(poster.get_article_max_age_seconds(), 12 * 3600)
+            self.assertEqual(settings.get_article_max_age_seconds(), 12 * 3600)
         for invalid in ("0", "-1", "nope", "12.5"):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                poster.get_article_max_age_seconds(invalid)
+                settings.get_article_max_age_seconds(invalid)
 
     def test_synthetic_full_state_checkpoint_measures_serialization_and_memory(self):
         title = "T" * 500
@@ -731,12 +728,12 @@ class PosterSafetyTests(unittest.TestCase):
             import tracemalloc
             tracemalloc.start()
             started = time.perf_counter()
-            poster.save_state(state, state["vus"], str(path))
+            persistence.save_state(state, state["vus"], str(path))
             duration = time.perf_counter() - started
             _, peak_bytes = tracemalloc.get_traced_memory()
             tracemalloc.stop()
             serialized_bytes = path.stat().st_size
-            reloaded = poster.load_state(str(path))
+            reloaded = persistence.load_state(str(path))
         self.assertGreater(duration, 0)
         self.assertGreater(peak_bytes, 0)
         self.assertGreater(serialized_bytes, 0)
@@ -755,19 +752,19 @@ class PosterSafetyTests(unittest.TestCase):
                 "vus": [], "file": [], "last_successful_send_at": "not-a-timestamp",
             }), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "last_successful_send_at"):
-                poster.load_state(str(path))
+                persistence.load_state(str(path))
 
     def test_telegram_interval_is_configurable_and_defaults_to_30(self):
         with patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(poster.get_telegram_interval_seconds(), 30)
+            self.assertEqual(settings.get_telegram_interval_seconds(), 30)
         for interval in (30, 60, 90, 120):
             with self.subTest(interval=interval):
-                self.assertEqual(poster.get_telegram_interval_seconds(str(interval)), interval)
+                self.assertEqual(settings.get_telegram_interval_seconds(str(interval)), interval)
                 with patch.dict(os.environ, {"TELEGRAM_INTERVAL_SECONDS": str(interval)}):
-                    self.assertEqual(poster.get_telegram_interval_seconds(), interval)
+                    self.assertEqual(settings.get_telegram_interval_seconds(), interval)
         for invalid in ("0", "-1", "abc", "30.5"):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
-                poster.get_telegram_interval_seconds(invalid)
+                settings.get_telegram_interval_seconds(invalid)
 
     def test_legacy_active_state_without_init_does_not_silence_new_feed_latest(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -777,7 +774,7 @@ class PosterSafetyTests(unittest.TestCase):
                 "file": [{"text": "pending", "link": "https://example.org/pending"}],
                 "feeds": ["https://example.org/old-feed"], "v": 1,
             }), encoding="utf-8")
-            state = poster.load_state(str(path))
+            state = persistence.load_state(str(path))
             feed = "https://example.org/new-feed"
             entries = [
                 {"id": "latest", "title": "Latest", "link": "https://example.org/latest"},
@@ -805,7 +802,7 @@ class PosterSafetyTests(unittest.TestCase):
         transport.get.return_value = response
         seen = collect_with_fresh_fixtures([feed], state, http=transport, parser=parser)
         transport.get.assert_called_once_with(
-            feed, headers={"User-Agent": poster.UA}, timeout=(5, 20),
+            feed, headers={"User-Agent": collection.UA}, timeout=(5, 20),
         )
         self.assertNotIn("bad-article", seen)
         self.assertIn("good-article", seen)
@@ -816,7 +813,7 @@ class PosterSafetyTests(unittest.TestCase):
         transport.post.side_effect = requests.Timeout("timeout")
         sleeper = Mock()
         with patch("builtins.print") as log:
-            self.assertFalse(poster.send_message(
+            self.assertFalse(publication.send_message(
                 {"text": "test"}, "fake-token", "fake-chat", http=transport, sleep=sleeper,
             ))
         transport.post.assert_called_once()
@@ -830,7 +827,7 @@ class PosterSafetyTests(unittest.TestCase):
         transport = Mock()
         transport.post.side_effect = [rate_limit, success]
         sleeper = Mock()
-        self.assertTrue(poster.send_message(
+        self.assertTrue(publication.send_message(
             {"text": "test"}, "fake-token", "fake-chat", http=transport, sleep=sleeper,
         ))
         self.assertEqual(transport.post.call_count, 2)
@@ -845,7 +842,7 @@ class PosterSafetyTests(unittest.TestCase):
         transport.post.return_value = response
         fake_clock = FakeClock(1700000124)
         with patch("builtins.print") as log:
-            result = poster.send_message(
+            result = publication.send_message(
                 {"text": "test"}, "sensitive-token", "sensitive-chat",
                 http=transport, clock=fake_clock, monotonic=fake_clock,
             )
@@ -868,7 +865,7 @@ class PosterSafetyTests(unittest.TestCase):
             item = {"text": "test", "link": "https://example.org", "pub": ""}
             state = {"vus": [], "file": [item], "feeds": [], "yt": {}, "v": 2}
             sender = Mock(return_value=False)
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False, sender=sender,
             )
             self.assertEqual(sent, 0)
@@ -884,7 +881,7 @@ class PosterSafetyTests(unittest.TestCase):
             state = {"vus": [], "file": [first, second], "feeds": [], "yt": {}, "v": 2}
             sender = Mock(side_effect=[True, False])
             fake_clock = FakeClock(123)
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=sender, interval_seconds=1, sleep=fake_clock.sleep,
                 max_per_run=5, clock=fake_clock, monotonic=fake_clock,
@@ -910,11 +907,11 @@ class PosterSafetyTests(unittest.TestCase):
                     send_times.append(fake_clock())
                     return True
 
-                sent = poster.process_queue(
+                sent = publication.process_queue(
                     state, {}, "token", "chat", state_path=path, dry_run=False,
                     sender=sender, interval_seconds=interval,
                     sleep=fake_clock.sleep, clock=fake_clock, monotonic=fake_clock,
-                    time_limit=(2 * interval) + poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+                    time_limit=(2 * interval) + settings.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
                 )
                 self.assertEqual(sent, 3)
                 self.assertEqual(
@@ -941,21 +938,21 @@ class PosterSafetyTests(unittest.TestCase):
                 return True
 
             with patch.dict(os.environ, {}, clear=True):
-                sent = poster.process_queue(
+                sent = publication.process_queue(
                     state, {}, "token", "chat", state_path=path, dry_run=False,
                     sender=sender, sleep=fake_clock.sleep,
                     clock=fake_clock, monotonic=fake_clock,
-                    time_limit=poster.RUN_BUDGET,
+                    time_limit=settings.RUN_BUDGET,
                 )
 
-            self.assertEqual(poster.get_telegram_interval_seconds(), 30)
+            self.assertEqual(settings.get_telegram_interval_seconds(), 30)
             self.assertEqual(sent, 10)
             self.assertEqual(len(state["file"]), 0)
             self.assertEqual(
                 [later - earlier for earlier, later in zip(send_times, send_times[1:])],
                 [30] * 9,
             )
-            self.assertLessEqual(fake_clock() - 1000, poster.RUN_BUDGET)
+            self.assertLessEqual(fake_clock() - 1000, settings.RUN_BUDGET)
 
     def test_remaining_interval_is_enforced_across_workflow_executions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -967,12 +964,12 @@ class PosterSafetyTests(unittest.TestCase):
             state = {"vus": [], "file": items.copy(), "feeds": [], "yt": {}, "v": 2}
             fake_clock = FakeClock(500)
             first = Mock(return_value=True)
-            poster.process_queue(
+            publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=first, interval_seconds=60, max_per_run=1,
                 clock=fake_clock, monotonic=fake_clock,
             )
-            persisted = poster.load_state(path)
+            persisted = persistence.load_state(path)
             self.assertEqual(persisted["last_successful_send_at"], 500)
 
             fake_clock.advance(59)
@@ -982,11 +979,11 @@ class PosterSafetyTests(unittest.TestCase):
                 second_send_times.append(fake_clock())
                 return True
 
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 persisted, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=second_sender, interval_seconds=60,
                 sleep=fake_clock.sleep, clock=fake_clock, monotonic=fake_clock,
-                time_limit=60 + poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+                time_limit=60 + settings.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
             )
             self.assertEqual(sent, 1)
             self.assertEqual(second_send_times, [560])
@@ -1006,23 +1003,23 @@ class PosterSafetyTests(unittest.TestCase):
                 raise RuntimeError("simulated workflow interruption")
 
             with self.assertRaisesRegex(RuntimeError, "workflow interruption"):
-                poster.process_queue(
+                publication.process_queue(
                     state, {}, "token", "chat", state_path=path, dry_run=False,
                     sender=Mock(return_value=True), interval_seconds=120,
                     sleep=interrupt_wait, clock=fake_clock, monotonic=fake_clock,
                     time_limit=400,
                 )
 
-            resumed = poster.load_state(path)
+            resumed = persistence.load_state(path)
             self.assertEqual(resumed["file"], [item])
             self.assertEqual(resumed["last_successful_send_at"], 100)
             fake_clock.advance(120)
             sender = Mock(return_value=True)
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 resumed, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=sender, interval_seconds=120,
                 sleep=fake_clock.sleep, clock=fake_clock, monotonic=fake_clock,
-                time_limit=poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+                time_limit=settings.MAX_TELEGRAM_SEND_BUDGET_SECONDS,
             )
             self.assertEqual(sent, 1)
             sender.assert_called_once()
@@ -1038,11 +1035,11 @@ class PosterSafetyTests(unittest.TestCase):
             }
             fake_clock = FakeClock(2000)
             sender = Mock(return_value=True)
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=sender, interval_seconds=120, sleep=fake_clock.sleep,
                 clock=fake_clock, monotonic=fake_clock,
-                time_limit=120 + poster.MAX_TELEGRAM_SEND_BUDGET_SECONDS - 1,
+                time_limit=120 + settings.MAX_TELEGRAM_SEND_BUDGET_SECONDS - 1,
             )
             self.assertEqual(sent, 0)
             sender.assert_not_called()
@@ -1061,7 +1058,7 @@ class PosterSafetyTests(unittest.TestCase):
             }
             fake_clock = FakeClock(3000)
             sender = Mock(return_value=True)
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=sender, interval_seconds=600, sleep=fake_clock.sleep,
                 clock=fake_clock, monotonic=fake_clock,
@@ -1077,9 +1074,9 @@ class PosterSafetyTests(unittest.TestCase):
             item = {"text": "one", "link": "https://example.org/1", "pub": ""}
             state = {"vus": [], "file": [item], "feeds": [], "yt": {}, "v": 2}
             fake_clock = FakeClock(1700001000.25)
-            result = poster.TelegramSendResult(True, message_id=987, telegram_date=1700001000)
+            result = publication.TelegramSendResult(True, message_id=987, telegram_date=1700001000)
             with patch("builtins.print") as log:
-                sent = poster.process_queue(
+                sent = publication.process_queue(
                     state, {}, "token", "chat", state_path=path, dry_run=False,
                     sender=Mock(return_value=result), interval_seconds=120,
                     clock=fake_clock, monotonic=fake_clock,
@@ -1097,8 +1094,8 @@ class PosterSafetyTests(unittest.TestCase):
         response = Mock(ok=False, status_code=400, text="chat not found")
         transport = Mock()
         transport.post.return_value = response
-        with self.assertRaises(poster.PermanentTelegramError):
-            poster.send_message(
+        with self.assertRaises(publication.PermanentTelegramError):
+            publication.send_message(
                 {"text": "test"}, "fake-token", "fake-chat", http=transport,
             )
         transport.post.assert_called_once()
@@ -1111,9 +1108,9 @@ class PosterSafetyTests(unittest.TestCase):
             state = {"vus": [], "file": [bad, good], "erreurs": [], "feeds": [], "yt": {}, "v": 2}
             def sender(item, token, chat_id):
                 if item is bad:
-                    raise poster.PermanentTelegramError("HTTP 400: chat not found")
+                    raise publication.PermanentTelegramError("HTTP 400: chat not found")
                 return True
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=sender, max_per_run=5, clock=lambda: 123,
             )
@@ -1132,13 +1129,13 @@ class PosterSafetyTests(unittest.TestCase):
         transport = Mock()
         transport.get.return_value = response
         parser = Mock(return_value=Mock(entries=[{"id": "one"}]))
-        parsed = poster.parse_feed(
+        parsed = collection.parse_feed(
             "https://example.org/feed", http=transport, parser=parser,
         )
         self.assertEqual(parsed.entries, [{"id": "one"}])
         transport.get.assert_called_once_with(
             "https://example.org/feed",
-            headers={"User-Agent": poster.UA},
+            headers={"User-Agent": collection.UA},
             timeout=(5, 20),
         )
         parser.assert_called_once_with(b"<rss/>")
@@ -1149,7 +1146,7 @@ class PosterSafetyTests(unittest.TestCase):
         transport = Mock()
         transport.get.return_value = response
         with self.assertRaises(requests.HTTPError):
-            poster.parse_feed("https://example.org/feed", http=transport)
+            collection.parse_feed("https://example.org/feed", http=transport)
 
 
     def test_full_queue_uses_admission_buffer_without_losing_fresh_articles(self):
@@ -1158,7 +1155,7 @@ class PosterSafetyTests(unittest.TestCase):
             {"id": "new-article", "title": "Nouvel article", "link": "https://example.org/new"},
         ]))
         state = {
-            "vus": [], "file": [{"text": "existing", "link": "https://example.org/old"}] * poster.MAX_FILE,
+            "vus": [], "file": [{"text": "existing", "link": "https://example.org/old"}] * admission.MAX_FILE,
             "feeds": [feed], "yt": {},
         }
         response = Mock(content=b"<rss/>")
@@ -1167,7 +1164,7 @@ class PosterSafetyTests(unittest.TestCase):
         transport.get.return_value = response
         seen = collect_with_fresh_fixtures([feed], state, http=transport, parser=parser)
         self.assertIn("new-article", seen)
-        self.assertEqual(len(state["file"]), poster.MAX_FILE)
+        self.assertEqual(len(state["file"]), admission.MAX_FILE)
         self.assertEqual(len(state["admission_buffer"]), 1)
         self.assertEqual(state["admission_buffer"][0]["uid"], "new-article")
         self.assertEqual(state["admission_buffer"][0]["admitted_at"], TEST_RSS_NOW)
@@ -1184,23 +1181,23 @@ class PosterSafetyTests(unittest.TestCase):
         )
         parser = Mock(side_effect=lambda content: Mock(entries=entries[content.decode()]))
         with tempfile.TemporaryDirectory() as directory, \
-                patch.object(poster, "MAX_FILE", 2), \
-                patch.object(poster, "MAX_ADMISSION_BUFFER", 0):
+                patch.object(admission, "MAX_FILE", 2), \
+                patch.object(admission, "MAX_ADMISSION_BUFFER", 0):
             path = str(Path(directory) / "state.json")
             state = {"vus": [], "file": [
                 {"text": "existing", "link": "https://example.org/existing"}
             ], "feeds": feeds.copy(), "yt": {}, "init": True, "feed_offset": 0}
             seen = collect_with_fresh_fixtures(
                 feeds, state, http=transport, parser=parser,
-                checkpoint=lambda current, ids: poster.save_state(current, ids, path),
+                checkpoint=lambda current, ids: persistence.save_state(current, ids, path),
             )
             self.assertIn("a1", seen)
             self.assertNotIn("b1", seen)
-            restarted = poster.load_state(path)
+            restarted = persistence.load_state(path)
             restarted["file"].pop(0)  # L’ancien article est traité pendant ce cycle.
             collect_with_fresh_fixtures(
                 feeds, restarted, http=transport, parser=parser,
-                checkpoint=lambda current, ids: poster.save_state(current, ids, path),
+                checkpoint=lambda current, ids: persistence.save_state(current, ids, path),
             )
             links = [item["link"] for item in restarted["file"]]
             self.assertCountEqual(links, ["https://example.org/a1", "https://example.org/b1"])
@@ -1262,11 +1259,11 @@ class PosterSafetyTests(unittest.TestCase):
         transport.get.return_value = response
         parser = Mock(return_value=Mock(entries=entries))
         state = {"yt": {}}
-        result = poster.entries_for_feed(feed, state, http=transport, parser=parser)
+        result = collection.entries_for_feed(feed, state, http=transport, parser=parser)
         self.assertEqual(result, entries)
         transport.get.assert_called_once_with(
             "https://www.youtube.com/feeds/videos.xml?user=example",
-            headers={"User-Agent": poster.UA}, timeout=(5, 20),
+            headers={"User-Agent": collection.UA}, timeout=(5, 20),
         )
         self.assertEqual(state["yt"], {})
 
@@ -1284,7 +1281,7 @@ class PosterSafetyTests(unittest.TestCase):
         entries = [{"id": "yt-two", "link": "https://youtube.com/watch?v=two"}]
         parser = Mock(side_effect=[Mock(entries=[]), Mock(entries=entries)])
         state = {"yt": {}}
-        result = poster.entries_for_feed(feed, state, http=transport, parser=parser)
+        result = collection.entries_for_feed(feed, state, http=transport, parser=parser)
         self.assertEqual(result, entries)
         self.assertEqual(state["yt"]["example"], channel_id)
         self.assertEqual(transport.get.call_count, 3)
@@ -1307,8 +1304,8 @@ class PosterSafetyTests(unittest.TestCase):
         parser = Mock(return_value=Mock(entries=[
             {"id": "new", "title": "New", "link": "https://example.org/new"},
         ]))
-        with patch.object(poster, "MAX_FILE", 1), \
-                patch.object(poster, "MAX_ADMISSION_BUFFER", 0), \
+        with patch.object(admission, "MAX_FILE", 1), \
+                patch.object(admission, "MAX_ADMISSION_BUFFER", 0), \
                 patch("builtins.print") as log:
             first_seen = collect_with_fresh_fixtures(feeds, state, http=transport, parser=parser)
             second_seen = collect_with_fresh_fixtures(feeds, state, http=transport, parser=parser)
@@ -1341,8 +1338,8 @@ class PosterSafetyTests(unittest.TestCase):
                 transport.post.return_value = response
                 metrics = {}
                 def sender(item, token, chat):
-                    return poster.send_message(item, token, chat, http=transport)
-                sent = poster.process_queue(
+                    return publication.send_message(item, token, chat, http=transport)
+                sent = publication.process_queue(
                     state, {}, "token", "chat", state_path=path, dry_run=False,
                     sender=sender, metrics=metrics,
                 )
@@ -1371,13 +1368,13 @@ class PosterSafetyTests(unittest.TestCase):
 
             for expected_offset in (1, 0, 1):
                 seen = collect_with_fresh_fixtures(feeds, state, http=transport, parser=parser)
-                poster.process_queue(
+                publication.process_queue(
                     state, seen, "token", "chat", state_path=path, dry_run=False,
                     sender=Mock(return_value=False),
                 )
                 saved = json.loads(Path(path).read_text())
                 self.assertEqual(saved["feed_offset"], expected_offset)
-                state = poster.load_state(path)
+                state = persistence.load_state(path)
 
     def test_interrupted_collection_resumes_from_checkpointed_next_feed(self):
         feeds = ["https://example.org/a", "https://example.org/b", "https://example.org/c"]
@@ -1392,7 +1389,7 @@ class PosterSafetyTests(unittest.TestCase):
             parser = Mock(return_value=Mock(entries=[]))
 
             def save_then_interrupt(current, seen):
-                poster.save_state(current, seen, str(path))
+                persistence.save_state(current, seen, str(path))
                 raise RuntimeError("simulated interruption")
 
             with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
@@ -1400,12 +1397,12 @@ class PosterSafetyTests(unittest.TestCase):
                     feeds, state, http=transport, parser=parser,
                     checkpoint=save_then_interrupt, checkpoint_every=1,
                 )
-            resumed = poster.load_state(path)
+            resumed = persistence.load_state(path)
             self.assertEqual(resumed["feed_offset"], 1)
             transport.get.reset_mock()
             collect_with_fresh_fixtures(
                 feeds, resumed, http=transport, parser=parser,
-                checkpoint=lambda current, seen: poster.save_state(current, seen, str(path)),
+                checkpoint=lambda current, seen: persistence.save_state(current, seen, str(path)),
             )
             self.assertEqual(
                 [call.args[0] for call in transport.get.call_args_list],
@@ -1459,7 +1456,7 @@ class PosterSafetyTests(unittest.TestCase):
         ]
         state = {"vus": [], "file": [
             {"text": "occupied", "link": "https://example.org/occupied"}
-        ] * poster.MAX_FILE, "feeds": [], "yt": {}, "init": True}
+        ] * admission.MAX_FILE, "feeds": [], "yt": {}, "init": True}
         response = Mock(content=b"<rss/>")
         response.raise_for_status.return_value = None
         transport = Mock()
@@ -1470,23 +1467,23 @@ class PosterSafetyTests(unittest.TestCase):
             state_path = str(Path(directory) / "state.json")
             seen = collect_with_fresh_fixtures(
                 [feed], state, http=transport, parser=parser,
-                checkpoint=lambda current, ids: poster.save_state(current, ids, state_path),
+                checkpoint=lambda current, ids: persistence.save_state(current, ids, state_path),
             )
             self.assertIn(feed, state["feeds"])
             self.assertIn("archive-1", seen)
             self.assertIn("archive-2", seen)
             self.assertIn("latest", seen)
-            self.assertEqual(len(state["file"]), poster.MAX_FILE)
+            self.assertEqual(len(state["file"]), admission.MAX_FILE)
             self.assertEqual(
                 [record["uid"] for record in state["admission_buffer"]],
                 ["latest"],
             )
 
-            restarted = poster.load_state(state_path)
+            restarted = persistence.load_state(state_path)
             restarted["file"].pop()
             collect_with_fresh_fixtures(
                 [feed], restarted, http=transport, parser=parser,
-                checkpoint=lambda current, ids: poster.save_state(current, ids, state_path),
+                checkpoint=lambda current, ids: persistence.save_state(current, ids, state_path),
             )
             self.assertIn("https://example.org/3", [item["link"] for item in restarted["file"]])
             self.assertEqual(sum(item["link"].endswith("/1") for item in restarted["file"]), 0)
@@ -1494,7 +1491,7 @@ class PosterSafetyTests(unittest.TestCase):
     def test_first_initialization_remains_silent_even_with_a_full_queue(self):
         feed = "https://example.org/feed"
         entry = {"id": "initial", "title": "Initial", "link": "https://example.org/1"}
-        state = {"vus": [], "file": [{"text": "x", "link": "https://example.org/x"}] * poster.MAX_FILE,
+        state = {"vus": [], "file": [{"text": "x", "link": "https://example.org/x"}] * admission.MAX_FILE,
                  "feeds": [], "yt": {}, "init": False}
         response = Mock(content=b"<rss/>")
         response.raise_for_status.return_value = None
@@ -1503,7 +1500,7 @@ class PosterSafetyTests(unittest.TestCase):
         parser = Mock(return_value=Mock(entries=[entry]))
         seen = collect_with_fresh_fixtures([feed], state, http=transport, parser=parser)
         self.assertIn("initial", seen)
-        self.assertEqual(len(state["file"]), poster.MAX_FILE)
+        self.assertEqual(len(state["file"]), admission.MAX_FILE)
         self.assertTrue(state["init"])
 
     def test_feed_errors_are_tracked_without_blocking_other_feeds_or_logging_query(self):
@@ -1557,7 +1554,7 @@ class PosterSafetyTests(unittest.TestCase):
             path = str(Path(directory) / "state.json")
             item = {"text": "test", "link": "https://example.org", "pub": ""}
             state = {"vus": [], "file": [item], "erreurs": [], "feeds": [], "yt": {}, "v": 2}
-            real_save = poster.save_state
+            real_save = persistence.save_state
             calls = {"count": 0}
 
             def fail_after_send(current, seen, state_path):
@@ -1567,18 +1564,18 @@ class PosterSafetyTests(unittest.TestCase):
                 raise OSError("simulated crash before post-send checkpoint")
 
             accepted = Mock(return_value=True)
-            with patch.object(poster, "save_state", side_effect=fail_after_send), \
+            with patch.object(persistence, "save_state", side_effect=fail_after_send), \
                  patch("builtins.print") as log:
                 with self.assertRaisesRegex(OSError, "simulated crash"):
-                    poster.process_queue(
+                    publication.process_queue(
                         state, {}, "token", "chat", state_path=path, dry_run=False,
                         sender=accepted,
                     )
             self.assertIn("doublon_possible_après_reprise: oui", str(log.call_args_list))
-            persisted = poster.load_state(path)
+            persisted = persistence.load_state(path)
             self.assertEqual(persisted["file"], [item])
             sender_after_restart = Mock(return_value=True)
-            poster.process_queue(
+            publication.process_queue(
                 persisted, {}, "token", "chat", state_path=path, dry_run=False,
                 sender=sender_after_restart,
             )
