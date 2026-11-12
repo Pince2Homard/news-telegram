@@ -3,10 +3,12 @@ name: Tests de sécurité et qualité
 on:
   push:
     branches:
-      - hardening/phase-1
-      - hardening/phase-2-operations
-      - hardening/phase-3-maintenance
-      - hardening/phase-4-reliability
+      - main
+      - 'codex/**'
+      - 'hardening/**'
+    # Toute autre modification reste couverte, y compris de futurs modules.
+    paths-ignore:
+      - state.json
   pull_request:
     branches:
       - main
@@ -30,6 +32,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - name: Vérifier la syntaxe
-        run: python -m compileall -q poster.py tests
+        run: python -m compileall -q poster.py cadence_simulator.py newsbot tools tests
       - name: Lancer les tests sans Telegram
         run: python -m unittest discover -s tests -v
