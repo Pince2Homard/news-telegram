@@ -1250,44 +1250,7 @@ class PosterSafetyTests(unittest.TestCase):
         self.assertEqual(state["file"], [])
         self.assertEqual(state["feed_health"][feed]["latest_uid"], "latest")
 
-    def test_youtube_legacy_feed_uses_username_feed_when_available(self):
-        feed = "https://gdata.youtube.com/feeds/base/users/example/uploads"
-        entries = [{"id": "yt-one", "link": "https://youtube.com/watch?v=one"}]
-        response = Mock(content=b"<feed/>")
-        response.raise_for_status.return_value = None
-        transport = Mock()
-        transport.get.return_value = response
-        parser = Mock(return_value=Mock(entries=entries))
-        state = {"yt": {}}
-        result = collection.entries_for_feed(feed, state, http=transport, parser=parser)
-        self.assertEqual(result, entries)
-        transport.get.assert_called_once_with(
-            "https://www.youtube.com/feeds/videos.xml?user=example",
-            headers={"User-Agent": collection.UA}, timeout=(5, 20),
-        )
-        self.assertEqual(state["yt"], {})
 
-    def test_youtube_legacy_feed_resolves_channel_from_page_as_fallback(self):
-        feed = "https://gdata.youtube.com/feeds/base/users/example/uploads"
-        channel_id = "UC1234567890123456789012"
-        empty = Mock(content=b"<feed/>")
-        empty.raise_for_status.return_value = None
-        page = Mock(text='"externalId":"' + channel_id + '"')
-        page.raise_for_status.return_value = None
-        channel_feed = Mock(content=b"<feed/>")
-        channel_feed.raise_for_status.return_value = None
-        transport = Mock()
-        transport.get.side_effect = [empty, page, channel_feed]
-        entries = [{"id": "yt-two", "link": "https://youtube.com/watch?v=two"}]
-        parser = Mock(side_effect=[Mock(entries=[]), Mock(entries=entries)])
-        state = {"yt": {}}
-        result = collection.entries_for_feed(feed, state, http=transport, parser=parser)
-        self.assertEqual(result, entries)
-        self.assertEqual(state["yt"]["example"], channel_id)
-        self.assertEqual(transport.get.call_count, 3)
-        self.assertEqual(
-            transport.get.call_args_list[1].kwargs["timeout"], 30,
-        )
 
 
     def test_feed_order_rotates_between_runs_and_deferrals_are_summarized(self):

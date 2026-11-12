@@ -1,6 +1,5 @@
 """Téléchargement RSS/Atom, parcours borné des flux et points de reprise."""
 import json
-import re
 import time
 import feedparser
 import requests
@@ -14,14 +13,6 @@ from .deduplication import prepare_seen_indexes
 from .metrics import _http_status_from_exception, _http_status_category, _retry_after_seconds, _feed_label
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"
-GDATA = re.compile(r"https?://gdata\.youtube\.com/feeds/base/users/([^/]+)/uploads")
-MOTIFS = [
-    r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
-    r'"externalId":"(UC[\w-]{22})"',
-    r'itemprop="channelId" content="(UC[\w-]{22})"',
-]
-
-
 def load_feeds(path="feeds.txt"):
     with open(path, encoding="utf-8") as source:
         return [
@@ -37,48 +28,9 @@ def parse_feed(url, http=requests, parser=feedparser.parse, timeout=(5, 20)):
     return parser(response.content)
 
 
-def entries_for_feed(url, state, http=requests, parser=feedparser.parse):
-    match = GDATA.match(url)
-    if not match:
-        return parse_feed(url, http=http, parser=parser).entries
-
-    username = match.group(1)
-    data = parse_feed(
-        "https://www.youtube.com/feeds/videos.xml?user=" + username,
-        http=http, parser=parser,
-    )
-    if data.entries:
-        return data.entries
-
-    if username not in state["yt"]:
-        try:
-            response = http.get(
-                "https://www.youtube.com/user/" + username,
-                headers={"User-Agent": UA, "Accept-Language": "fr"},
-                cookies={"CONSENT": "YES+1"}, timeout=30,
-            )
-            response.raise_for_status()
-            for pattern in MOTIFS:
-                found = re.search(pattern, response.text)
-                if found:
-                    state["yt"][username] = found.group(1)
-                    break
-        except requests.RequestException as exc:
-            status = _http_status_from_exception(exc)
-            print(
-                "Erreur résolution YouTube |", type(exc).__name__,
-                "| HTTP:", status if status is not None else "n/a",
-                "| catégorie:", _http_status_category(status),
-            )
-
-    if username in state["yt"]:
-        data = parse_feed(
-            "https://www.youtube.com/feeds/videos.xml?channel_id=" + state["yt"][username],
-            http=http, parser=parser,
-        )
-        return data.entries
-    print("Chaîne YouTube non résolue")
-    return []
+def entries_for_feed(url, http=requests, parser=feedparser.parse):
+    """Récupère directement les entrées d’un flux RSS/Atom configuré."""
+    return parse_feed(url, http=http, parser=parser).entries
 
 
 def collect_articles(
@@ -153,7 +105,7 @@ def collect_articles(
         feed_started = clock()
         counts["attempted"] += 1
         try:
-            entries = entries_for_feed(url, state, http=http, parser=parser)
+            entries = entries_for_feed(url, http=http, parser=parser)
         except Exception as exc:
             counts["error"] += 1
             health = state["feed_health"].setdefault(url, {"consecutive_errors": 0})
