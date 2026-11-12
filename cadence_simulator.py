@@ -379,7 +379,7 @@ def build_simulation(
     previous_simulation=None, next_run_seconds=300.0, send_request_seconds=0.5,
     send_operation_seconds=None, workflow_nonpublishing_seconds=None,
     seconds_since_last_success=None, send_budget_floor_seconds=210.0,
-    max_per_run=50, max_queue=1000,
+    max_per_run=50, max_queue=1000, include_provisional_observation=True,
 ):
     """Construit une recommandation de simulation et les scénarios comparatifs."""
     prior = previous_simulation if isinstance(previous_simulation, dict) else {}
@@ -394,23 +394,34 @@ def build_simulation(
         estimated_send_operation_seconds(history, fallback=send_request_seconds)
         if send_operation_seconds is None else max(0.01, _number(send_operation_seconds))
     )
-    provisional_history = list(history) + [{
-        "run_started_epoch": run_started_epoch,
-        "articles_discovered": articles_discovered,
-        "articles_admissible": admissible,
-        "queue_final": queue_depth,
-    }]
-    trend = queue_trend_per_run(history, queue_depth)
-    arrivals = estimated_arrivals_per_minute(provisional_history)
-    recommendation = regulate_simulated_interval(
-        queue_depth=queue_depth,
-        trend_per_run=trend,
-        oldest_age_seconds=oldest_age_seconds,
-        current_interval_seconds=prior.get("interval_seconds", 30),
-        candidate_interval_seconds=prior.get("candidate_interval_seconds"),
-        candidate_observations=prior.get("candidate_observations", 0),
-        history_runs=len(history),
-    )
+    if include_provisional_observation:
+        observed_history = list(history) + [{
+            "run_started_epoch": run_started_epoch,
+            "articles_discovered": articles_discovered,
+            "articles_admissible": admissible,
+            "queue_final": queue_depth,
+        }]
+        trend = queue_trend_per_run(history, queue_depth)
+        recommendation = regulate_simulated_interval(
+            queue_depth=queue_depth,
+            trend_per_run=trend,
+            oldest_age_seconds=oldest_age_seconds,
+            current_interval_seconds=prior.get("interval_seconds", 30),
+            candidate_interval_seconds=prior.get("candidate_interval_seconds"),
+            candidate_observations=prior.get("candidate_observations", 0),
+            history_runs=len(history),
+        )
+    else:
+        # Une consultation du snapshot n'est ni un passage du bot, ni une
+        # observation d'hystérésis supplémentaire, ni une collecte sans arrivées.
+        observed_history = _valid_records(history)[-MAX_SIMULATION_HISTORY:]
+        pending_history = _pending_history(observed_history)
+        latest = pending_history[-1] if pending_history else {}
+        trend = queue_trend_per_run(
+            pending_history[:-1], latest.get("queue_final", queue_depth),
+        )
+        recommendation = replay_recommendation(observed_history)
+    arrivals = estimated_arrivals_per_minute(observed_history)
     scenarios = simulate_intervals(
         queue_depth=queue_depth,
         available_seconds=available_seconds,
@@ -436,3 +447,123 @@ def build_simulation(
         "schedule_uncertainty_note": "GitHub Actions peut retarder ou regrouper les déclenchements; cette projection n'est pas une garantie.",
         "scenarios": scenarios,
     }
+
+
+def previous_simulation(history):
+    """Lit les champs de simulation historiques sans modifier l'ancien état."""
+    if not history or not isinstance(history[-1], dict):
+        return None
+    latest = history[-1]
+    return {
+        "interval_seconds": latest.get("simulated_interval_seconds", 30),
+        "candidate_interval_seconds": latest.get("simulated_candidate_interval_seconds"),
+        "candidate_observations": latest.get("simulated_candidate_observations", 0),
+    }
+
+
+def _pending_history(history):
+    """Inclut le tampon déjà admis dans les profondeurs du rejeu hors ligne."""
+    return [{
+        **record,
+        "queue_final": max(0, int(_number(record.get("queue_final"))))
+            + max(0, int(_number(record.get("admission_buffer_final")))),
+    } for record in _valid_records(history)[-MAX_SIMULATION_HISTORY:]]
+
+
+def replay_recommendation(history):
+    """Rejoue en mémoire les seuls passages observés dans l'historique borné.
+
+    Les anciennes recommandations persistées servent de points de reprise.
+    Après leur sortie de la fenêtre, le rejeu repart de 30 s ; il reste informatif.
+    """
+    records = _pending_history(history)
+    prior = regulate_simulated_interval(
+        queue_depth=0, trend_per_run=0, oldest_age_seconds=None,
+    )
+    for index, record in enumerate(records):
+        depth = max(0, int(_number(record.get("queue_final"))))
+        prior = regulate_simulated_interval(
+            queue_depth=depth,
+            trend_per_run=queue_trend_per_run(records[:index], depth),
+            oldest_age_seconds=record.get("oldest_pending_age_seconds"),
+            current_interval_seconds=prior["interval_seconds"],
+            candidate_interval_seconds=prior.get("candidate_interval_seconds"),
+            candidate_observations=prior.get("candidate_observations", 0),
+            history_runs=index,
+        )
+        if "simulated_interval_seconds" in record:
+            prior.update(previous_simulation([record]))
+            prior["reason"] = "reprise_simulation_historique"
+    return prior
+
+
+def main(argv=None):
+    """Analyse explicitement un état existant, sans collecte, envoi ni écriture."""
+    import argparse
+    import json
+    from pathlib import Path
+    import time
+    from newsbot.persistence import load_state
+    from newsbot.metrics import _oldest_pending_age_seconds
+    from newsbot.settings import (
+        RUN_BUDGET, MAX_TELEGRAM_SEND_BUDGET_SECONDS, MAX_PAR_RUN,
+        MAX_FILE, MAX_ADMISSION_BUFFER, get_telegram_interval_seconds,
+    )
+
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("--state", default="state.json", help="Snapshot existant à lire")
+    parser.add_argument("--now", type=float, help="Heure Unix UTC pour une analyse reproductible")
+    parser.add_argument("--available-seconds", type=float, help="Budget hypothétique de publication")
+    args = parser.parse_args(argv)
+    now = time.time() if args.now is None else args.now
+    if not isfinite(now) or now < 0:
+        parser.error("--now doit être une heure Unix finie et positive ou nulle")
+    if args.available_seconds is not None and (
+        not isfinite(args.available_seconds) or args.available_seconds < 0
+    ):
+        parser.error("--available-seconds doit être fini et positif ou nul")
+    if not Path(args.state).is_file():
+        parser.error("Le snapshot demandé n'existe pas ; aucun nouvel état n'est créé")
+    state = load_state(args.state)
+    history = _valid_records(state.get("metrics_history", []))[-MAX_SIMULATION_HISTORY:]
+    collection = [_number(record.get("collection_seconds")) for record in history]
+    collection_seconds = median(collection) if collection else 0.0
+    available = max(0.0, RUN_BUDGET - collection_seconds) if args.available_seconds is None else args.available_seconds
+    last_success = state.get("last_successful_send_at")
+    plan = build_simulation(
+        history=history,
+        queue_depth=len(state["file"]) + len(state["admission_buffer"]),
+        oldest_age_seconds=_oldest_pending_age_seconds(
+            state["file"], now_epoch=now, admission_buffer=state["admission_buffer"],
+        ),
+        available_seconds=available, run_started_epoch=now,
+        workflow_nonpublishing_seconds=collection_seconds + estimated_nonpublishing_seconds(history),
+        send_request_seconds=estimated_send_request_seconds(history),
+        send_operation_seconds=estimated_send_operation_seconds(history),
+        seconds_since_last_success=max(0.0, now - last_success) if last_success is not None else None,
+        send_budget_floor_seconds=MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+        max_per_run=MAX_PAR_RUN, max_queue=MAX_FILE + MAX_ADMISSION_BUFFER,
+        include_provisional_observation=False,
+    )
+    plan["snapshot"] = {
+        "analysis_epoch": now,
+        "history_observations": len(history),
+        "latest_observed_run_epoch": history[-1].get("run_started_epoch") if history else None,
+        "configured_interval_seconds": get_telegram_interval_seconds(),
+        "queue_depth": len(state["file"]),
+        "admission_buffer_depth": len(state["admission_buffer"]),
+        "quarantine_depth_excluded": len(state["date_quarantine"]),
+        "available_seconds_assumption": available,
+        "limitations": [
+            "État lu sans nouvelle collecte ; les arrivées ultérieures sont inconnues.",
+            "L'hystérésis est rejouée sur au plus 12 passages, avec reprise des anciens champs si présents.",
+            "Les anciens conseils précédaient l'envoi ; le rejeu utilise les profondeurs finales observées.",
+            "La quarantaine n'est pas publiable et reste exclue de la projection.",
+            "Aucune recommandation ne modifie la cadence configurée ni l'état.",
+        ],
+    }
+    print(json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    main()

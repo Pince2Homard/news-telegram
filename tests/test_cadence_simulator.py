@@ -1,3 +1,4 @@
+import io
 import json
 import tempfile
 import time
@@ -11,7 +12,7 @@ from newsbot import collection, persistence, admission, dates, deduplication, me
 
 
 class CadenceSimulationTests(unittest.TestCase):
-    def test_dry_run_main_emits_structured_simulation_without_sending_or_saving(self):
+    def test_dry_run_main_emits_metrics_without_simulation_sending_or_saving(self):
         state = {
             "vus": [], "file": [{
                 "text": "pending", "link": "https://example.org/article",
@@ -35,7 +36,9 @@ class CadenceSimulationTests(unittest.TestCase):
         )
         parsed = json.loads(summary)
         self.assertEqual(parsed["telegram_interval_configured_seconds"], 30)
-        self.assertEqual(len(parsed["simulation"]["scenarios"]), 5)
+        self.assertNotIn("simulation", parsed)
+        self.assertEqual(parsed["queue_final"], 1)
+        self.assertIn("articles_admissible", parsed)
         self.assertEqual(parsed["published"], 0)
 
     def test_empty_queue_has_no_publication_capacity_or_clearance_work(self):
@@ -269,7 +272,7 @@ class CadenceSimulationTests(unittest.TestCase):
             history=resumed["metrics_history"], queue_depth=500,
             oldest_age_seconds=80000, available_seconds=720,
             run_started_epoch=900, articles_discovered=50,
-            previous_simulation=poster._previous_simulation(resumed["metrics_history"]),
+            previous_simulation=cadence_simulator.previous_simulation(resumed["metrics_history"]),
         )
         self.assertEqual(plan["recommendation"]["interval_seconds"], 25)
 
@@ -432,6 +435,66 @@ class CadenceSimulationTests(unittest.TestCase):
         self.assertEqual(state["metrics_history"][0]["run_started_epoch"], 3)
         self.assertNotIn("example.org", encoded)
         self.assertNotIn("secret", encoded)
+
+    def test_explicit_cli_is_read_only_offline_and_does_not_add_an_observation(self):
+        history = [
+            {"run_started_epoch": (index + 1) * 300, "queue_final": depth,
+             "articles_admissible": 10, "oldest_pending_age_seconds": 100}
+            for index, depth in enumerate((100, 250, 500, 700))
+        ]
+        history[1].update({
+            "simulated_interval_seconds": 30,
+            "simulated_candidate_interval_seconds": 10,
+            "simulated_candidate_observations": 1,
+        })
+        state = {"vus": [], "file": [
+            {"text": "synthetic", "link": f"https://example.invalid/{index}", "queued_at": 1000}
+            for index in range(700)
+        ], "metrics_history": history}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            before = json.dumps(state).encode("utf-8")
+            path.write_bytes(before)
+            outputs = []
+            with patch("requests.sessions.Session.request", side_effect=AssertionError("network forbidden")):
+                for _ in range(2):
+                    output = io.StringIO()
+                    with patch("sys.stdout", output):
+                        cadence_simulator.main([
+                            "--state", str(path), "--now", "2000", "--available-seconds", "400",
+                        ])
+                    outputs.append(json.loads(output.getvalue()))
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(list(Path(directory).iterdir()), [path])
+        self.assertEqual(outputs[0], outputs[1])
+        plan = outputs[0]
+        self.assertEqual(plan["snapshot"]["history_observations"], 4)
+        self.assertEqual(plan["snapshot"]["analysis_epoch"], 2000)
+        self.assertEqual(plan["estimated_arrivals_per_minute"], 2)
+        self.assertEqual(plan["recommendation"]["interval_seconds"], 25)
+        self.assertEqual(plan["recommendation"]["candidate_observations"], 1)
+        self.assertEqual(len(plan["scenarios"]), 5)
+
+    def test_explicit_cli_refuses_missing_state_without_creating_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing.json"
+            with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit) as error:
+                cadence_simulator.main(["--state", str(path), "--now", "1000"])
+            self.assertEqual(error.exception.code, 2)
+            self.assertFalse(path.exists())
+
+    def test_offline_replay_counts_already_admitted_buffer_pressure(self):
+        history = [{"queue_final": 50, "admission_buffer_final": 800} for _ in range(4)]
+        recommendation = cadence_simulator.replay_recommendation(history)
+        self.assertEqual(recommendation["target_interval_seconds"], 10)
+        self.assertEqual(recommendation["interval_seconds"], 25)
+
+    def test_explicit_cli_refuses_invalid_numeric_assumptions(self):
+        for arguments in (("--now", "nan"), ("--available-seconds", "-1")):
+            with self.subTest(arguments=arguments), patch("sys.stderr", io.StringIO()), \
+                    self.assertRaises(SystemExit) as error:
+                cadence_simulator.main(list(arguments))
+            self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":

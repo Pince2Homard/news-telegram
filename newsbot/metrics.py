@@ -128,12 +128,6 @@ def _store_run_metrics(state, metrics):
         "telegram_request_duration_seconds": metrics.get("telegram_request_duration_seconds", 0),
         "telegram_send_operations": metrics.get("telegram_send_operations", 0),
         "telegram_call_duration_seconds": metrics.get("telegram_call_duration_seconds", 0),
-        "simulated_interval_seconds": metrics.get("simulation", {})
-            .get("recommendation", {}).get("interval_seconds", 30),
-        "simulated_candidate_interval_seconds": metrics.get("simulation", {})
-            .get("recommendation", {}).get("candidate_interval_seconds"),
-        "simulated_candidate_observations": metrics.get("simulation", {})
-            .get("recommendation", {}).get("candidate_observations", 0),
     }])[-MAX_METRICS_HISTORY:]
 
 
