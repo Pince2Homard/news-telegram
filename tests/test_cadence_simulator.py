@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 import cadence_simulator
 import poster
+from newsbot import collection, persistence, admission, dates, deduplication, metrics as run_metrics, publication, settings
 
 
 class CadenceSimulationTests(unittest.TestCase):
@@ -23,7 +24,7 @@ class CadenceSimulationTests(unittest.TestCase):
                 "STATE_FILE": str(state_path),
             }, clear=True), patch.object(poster, "load_feeds", return_value=[]), \
                  patch.object(poster, "load_state", return_value=state), \
-                 patch.object(poster, "send_message") as sender, \
+                 patch.object(publication.requests, "post") as sender, \
                  patch("builtins.print") as log:
                 poster.main()
         sender.assert_not_called()
@@ -246,10 +247,10 @@ class CadenceSimulationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
             path.write_text(json.dumps({"v": 2, "file": pending, "vus": ["seen"]}), encoding="utf-8")
-            state = poster.load_state(str(path))
+            state = persistence.load_state(str(path))
         self.assertEqual(state["file"], pending)
         self.assertEqual(state["metrics_history"], [])
-        self.assertIsNone(poster._oldest_pending_age_seconds(state["file"], now_epoch=2000000000))
+        self.assertIsNone(run_metrics._oldest_pending_age_seconds(state["file"], now_epoch=2000000000))
 
     def test_simulated_hysteresis_survives_restart_in_bounded_state_history(self):
         state = {"file": [], "vus": [], "metrics_history": [
@@ -262,8 +263,8 @@ class CadenceSimulationTests(unittest.TestCase):
         ]}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"
-            poster.save_state(state, {}, str(path))
-            resumed = poster.load_state(str(path))
+            persistence.save_state(state, {}, str(path))
+            resumed = persistence.load_state(str(path))
         plan = cadence_simulator.build_simulation(
             history=resumed["metrics_history"], queue_depth=500,
             oldest_age_seconds=80000, available_seconds=720,
@@ -291,7 +292,7 @@ class CadenceSimulationTests(unittest.TestCase):
         )
         self.assertLess(plan["target_interval_seconds"], 30)
         with tempfile.TemporaryDirectory() as directory:
-            sent = poster.process_queue(
+            sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=str(Path(directory) / "state.json"),
                 dry_run=False, sender=sender, sleep=fake.sleep, clock=fake,
                 monotonic=fake, interval_seconds=60, time_limit=1000,
@@ -308,7 +309,7 @@ class CadenceSimulationTests(unittest.TestCase):
             history=[], queue_depth=1, oldest_age_seconds=None,
             available_seconds=720, run_started_epoch=1, articles_discovered=0,
         )
-        sent = poster.process_queue(
+        sent = publication.process_queue(
             state, {}, "token", "chat", dry_run=True, sender=sender,
         )
         self.assertEqual(len(plan["scenarios"]), 5)
@@ -329,14 +330,14 @@ class CadenceSimulationTests(unittest.TestCase):
         transport.get.return_value = response
         state = {"vus": [], "file": [], "feeds": [feed], "yt": {}, "init": True}
         metrics = {}
-        seen = poster.collect_articles(
+        seen = collection.collect_articles(
             [feed], state, http=transport,
             parser=Mock(return_value=Mock(entries=[entry])),
             metrics=metrics, queue_clock=lambda: 1000,
         )
         self.assertEqual(state["file"][0]["queued_at"], 1000)
         self.assertEqual(state["file"][0]["pub"], "1970-01-01T00:16:39Z")
-        self.assertEqual(poster._oldest_pending_age_seconds(state["file"], now_epoch=1017), 17)
+        self.assertEqual(run_metrics._oldest_pending_age_seconds(state["file"], now_epoch=1017), 17)
         self.assertEqual(metrics["articles_discovered"], 1)
         self.assertEqual(metrics["articles_admissible"], 1)
         self.assertEqual(metrics["articles_added"], 1)
@@ -362,7 +363,7 @@ class CadenceSimulationTests(unittest.TestCase):
             "feed_health": {feed: {"latest_uid": "cursor"}},
         }
         metrics = {}
-        poster.collect_articles(
+        collection.collect_articles(
             [feed], state, http=Mock(get=Mock(return_value=response)),
             parser=Mock(return_value=Mock(entries=entries)), metrics=metrics,
             queue_clock=lambda: 1000,
@@ -388,11 +389,11 @@ class CadenceSimulationTests(unittest.TestCase):
         state = {
             "vus": [],
             "file": [{"text": "occupied", "link": "https://example.org/occupied"}]
-                * poster.MAX_FILE,
+                * admission.MAX_FILE,
             "feeds": [feed], "yt": {}, "init": True,
         }
         metrics = {}
-        seen = poster.collect_articles(
+        seen = collection.collect_articles(
             [feed], state, http=Mock(get=Mock(return_value=response)),
             parser=Mock(return_value=Mock(entries=[entry])), metrics=metrics,
             queue_clock=lambda: 1_800_000_000, max_age_seconds=24 * 3600,
@@ -404,12 +405,12 @@ class CadenceSimulationTests(unittest.TestCase):
         self.assertEqual(metrics["rss_deferred"], 0)
         self.assertIn("deferred", seen)
         self.assertEqual(len(state["admission_buffer"]), 1)
-        self.assertEqual(len(state["file"]), poster.MAX_FILE)
+        self.assertEqual(len(state["file"]), admission.MAX_FILE)
 
     def test_run_metrics_history_stays_bounded_and_contains_no_article_content(self):
         state = {"metrics_history": []}
         for index in range(15):
-            poster._store_run_metrics(state, {
+            run_metrics._store_run_metrics(state, {
                 "run_started_epoch": index,
                 "feeds_examined": 63,
                 "articles_discovered": 3,
