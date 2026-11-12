@@ -103,3 +103,4 @@ avec `--reference COMMIT`.
 - [Référence du chantier](docs/maintenance-reference.md),
   [observations disponibles](docs/maintenance-observations.md) et
   [propositions fonctionnelles différées](docs/functional-proposals.md).
+- [Bilan et vérifications](docs/maintenance-results.md).
