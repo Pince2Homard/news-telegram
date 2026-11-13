@@ -46,17 +46,23 @@ Après modifications : **111 tests réussis**, Ruff réussi. La couverture n'a p
 de l'état réel. Les chemins Windows de fsync de répertoire ne reproduisent pas
 toutes les possibilités du runner Linux ; la CI apporte cette autre plateforme.
 
-**Audit en échec visible : un avis sur requests 2.32.4**, identifié comme
+**Constat initial conservé : l'audit échouait sur requests 2.32.4**, identifié comme
 PYSEC-2026-2275 / CVE-2026-25645 / GHSA-gc5v-m9x4-r6x2.
 Selon l'[avis GitHub](https://github.com/advisories/GHSA-gc5v-m9x4-r6x2), il concerne
 la réutilisation d'un fichier temporaire par extract_zipped_paths, avec attaquant
 local capable de préparer ce fichier. L'usage standard n'est pas affecté ; aucun
 appel direct à cet utilitaire trouvé dans le dépôt. Applicabilité non établie au
-bot actuel, sans annuler le constat de version affectée. Correction proposée
-dans une PR distincte : évaluer Requests >= 2.33.0 et vérifier les transports.
-Ni mise à jour, ni ignore-vuln, ni continue-on-error appliqué ici : la CI doit
-signaler cet avis tant que la dépendance reste affectée. L'analyse locale inclut
-les dépendances transitives résolues ; elles peuvent varier selon date/plateforme.
+bot actuel, sans annuler le constat de version affectée.
+
+**Correction intégrée séparément par la [PR #17](https://github.com/Pince2Homard/news-telegram/pull/17)** :
+Requests 2.34.2, commit de fusion `361fa866401719dc60886d72606af566ba09b220`.
+La [CI du correctif](https://github.com/Pince2Homard/news-telegram/actions/runs/43443726108)
+et la [validation préalable de la composition avec #16](https://github.com/Pince2Homard/news-telegram/actions/runs/43443797197)
+ont réussi : tests et audit sans vulnérabilité connue. La branche #16 a ensuite
+été actualisée avec main, en conservant son état courant, pour exécuter sa propre
+CI. Aucun ignore-vuln ni continue-on-error n'a été ajouté ; l'échec initial reste
+documenté et n'a pas été masqué. L'audit inclut les dépendances transitives
+résolues ; les résultats peuvent varier selon la date et la plateforme.
 
 ## Métadonnées proposées, non appliquées
 
