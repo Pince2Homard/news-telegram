@@ -6,6 +6,7 @@ from .settings import DEFAULT_TELEGRAM_INTERVAL_SECONDS as DEFAULT_TELEGRAM_INTE
 from . import persistence
 from .admission import _drain_admission_buffer
 from .metrics import _utc_iso, _http_status_from_exception, _http_status_category, _feed_label
+from .network_diagnostics import network_diagnostic
 
 
 class PermanentTelegramError(Exception):
@@ -65,11 +66,25 @@ def send_message(
             status = _http_status_from_exception(exc)
             if status is not None:
                 http_errors += 1
+            try:
+                diagnostic = network_diagnostic(exc)
+            except Exception:
+                # Le diagnostic ne doit jamais empêcher l'arrêt prudent.
+                diagnostic = {
+                    "category": "diagnostic_unavailable", "phase": "unknown",
+                    "http_response_attached": None, "http_response_received": None,
+                }
             print(
                 "TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
                 "| tentative:", f"{attempt + 1}/{TELEGRAM_MAX_ATTEMPTS}",
                 "| résultat: réseau_ambigu | HTTP:", status if status is not None else "n/a",
                 "| durée_s:", round(duration, 3), "| erreur:", type(exc).__name__,
+                "| catégorie_réseau:", diagnostic["category"],
+                "| phase_identifiable:", diagnostic["phase"],
+                "| réponse_HTTP_attachée:", diagnostic["http_response_attached"],
+                "| réponse_HTTP_reçue:", (
+                    "oui" if diagnostic["http_response_received"] else "inconnue"
+                ),
             )
             return TelegramSendResult(
                 False, attempts=attempt + 1, attempt_errors=attempt_errors,
@@ -294,6 +309,13 @@ def process_queue(
             telegram_errors += 1
             if not isinstance(outcome, TelegramSendResult) or not outcome.attempt_errors:
                 telegram_attempt_errors += 1
+            print(
+                "PUBLICATION INTERROMPUE | raison: resultat_non_confirme",
+                "| écoulé_avant_opération_s:", round(max(0.0, call_started - started), 3),
+                "| budget_avant_opération_s:", round(time_limit - (call_started - started), 3),
+                "| réserve_opération_s:", MAX_TELEGRAM_SEND_BUDGET_SECONDS,
+                "| publiés_confirmés:", sent,
+            )
             break
 
         telegram_date = outcome.telegram_date if isinstance(outcome, TelegramSendResult) else None
