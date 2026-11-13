@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 14
     steps:
       - name: Récupérer la branche de test
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
