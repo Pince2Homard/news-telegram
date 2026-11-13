@@ -527,6 +527,23 @@ class Watcher:
                 and not isinstance(entry.get("id"), bool) and entry["id"] > 0
             ]
             entries.sort(key=lambda entry: entry["id"])
+            # Une suppression ou édition qui retire le préfixe/JSON doit aussi
+            # invalider les anciens éléments, même sans nouvel événement reconnu.
+            present = {entry["id"]: entry for entry in entries}
+            for record in state.get("coordination_registry", {}).values():
+                origin = record["event"]
+                if origin["thread"] != thread["key"] or origin["source"] != source:
+                    continue
+                current = present.get(origin["comment_id"])
+                if current is None:
+                    record["source_missing"] = True
+                    continue
+                body = current.get("body")
+                user = current.get("user")
+                author = user.get("login") if isinstance(user, dict) else None
+                if (not isinstance(body, str) or hashlib.sha256(body.encode()).hexdigest() != origin["content_digest"]
+                        or author != origin["author"]):
+                    record["source_changed"] = True
             high_water = int(cursors.get(source, 0))
             newest = high_water
             for comment in entries:

@@ -150,6 +150,25 @@ class CoordinationTests(unittest.TestCase):
         with self.assertRaises(watcher.WatcherError):
             self.poller.run_once(notify=False, transfer_id=TASK)
 
+    def test_removed_prefix_or_deleted_source_invalidates_old_directive(self):
+        self.poller.run_once()
+        self.api.comments[0]["body"] = "no longer a directive"
+        self.poller.run_once()
+        self.assertEqual(coordination.rows(self.state(), REPO, NOW)[0]["condition"], "source_changed")
+        self.api.comments = self.api.comments[1:]
+        self.poller.run_once()
+        self.assertEqual(coordination.rows(self.state(), REPO, NOW)[0]["condition"], "source_missing")
+        self.assertEqual(self.poller.run_once(prepare_ready=True)["prepared_transfers"], [])
+
+    def test_url_only_decision_cannot_authorize_replacement_at_same_url(self):
+        self.api.comments[1] = comment(2, envelope(OWNER, kind="decision", status="authorized",
+            reply_to=f"https://github.com/{REPO}/issues/7#issuecomment-1"), "OWNER-DECISION")
+        with self.assertRaises(watcher.WatcherError):
+            self.poller.run_once(notify=False, transfer_id=TASK)
+        self.api.comments[0] = comment(1, envelope(OTHER))
+        with self.assertRaises(watcher.WatcherError):
+            self.poller.run_once(notify=False, transfer_id=OTHER)
+
     def test_expiration_revocation_and_unknown_author_block_transfer(self):
         self.poller.run_once()
         original = self.state()

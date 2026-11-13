@@ -68,7 +68,10 @@ GitHub et empreinte de contenu/version ; `event_id` est sa référence locale.
 L'empreinte est persistée, jamais le corps. Une édition crée un événement distinct
 si sa nouvelle version est détectable. Le registre réconcilie maintenant les copies du même identifiant publiées
 par le même auteur avec un corps/enveloppe/préfixe identique : une seule entrée,
-avec les références GitHub associées. Réutiliser l'UUID avec un autre contenu ou
+avec les références GitHub associées. Si le commentaire canonique est supprimé
+ou perd son préfixe/JSON, sa référence devient source_missing/source_changed et
+ne reste pas admissible. Les copies ne réparent pas automatiquement cette origine.
+Réutiliser l'UUID avec un autre contenu ou
 auteur crée un conflit bloquant. Une édition du corps libre est aussi un changement,
 même si le JSON/SHA reste identique. Créer un nouvel UUID et reply_to pour une
 correction ou un nouveau statut. Les notifications ne sont pas des validations.
@@ -98,7 +101,9 @@ sans produire de notification historique. Les accusés peuvent viser leur event_
 
 Les enveloppes sont comparées au head.sha de la PR observé via l'API GitHub :
 current, stale_sha, unverified_sha, closed_pr, expired, conflict ou unverified_author.
-Un statut déclaré completed/failed/rejected/superseded reste visible. Une déclaration
+Un statut déclaré completed/failed/rejected/superseded reste visible. Une décision
+de préparation doit référencer l'UUID : un lien de commentaire rééditable ne peut
+pas transmettre son approbation à une nouvelle directive placée à la même URL. Une déclaration
 OWNER-DECISION connue rejected/superseded visant le même UUID/lien, PR, SHA et action
 retire l'admissibilité de la directive (withdrawn). Une nouvelle directive avec un
 nouvel UUID est nécessaire pour lever cette ambiguïté ; aucune approbation implicite.
@@ -119,7 +124,7 @@ son même budget/transport GET. Conditions :
   sans conflit/révocation ni statut local done/ignored ;
 - action prédéfinie review_only ou diagnose_only ;
 - une unique déclaration OWNER-DECISION connue authorized, visant la directive
-  par UUID/lien, avec même PR/SHA/action ;
+  par son UUID immuable (un lien seul ne suffit pas), avec même PR/SHA/action ;
 - CI complète réussie relue depuis moins de 120 secondes ;
 - vérification finale de la PR et relecture des commentaires directive/décision,
   pour refuser les modifications intervenues pendant le relevé.

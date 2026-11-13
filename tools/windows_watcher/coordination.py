@@ -121,6 +121,10 @@ def condition(record, state, now):
     envelope = event["coordination"]
     if record["conflict"]:
         return "conflict"
+    if record.get("source_missing"):
+        return "source_missing"
+    if record.get("source_changed"):
+        return "source_changed"
     if not event["authorized_author"]:
         return "unverified_author"
     if envelope["expires_at"] and epoch(envelope["expires_at"]) <= now:
@@ -271,7 +275,7 @@ def packet_data(state, identity, repository, now):
         envelope = decision["coordination"]
         if (condition(candidate, state, now) == "current" and decision["prefix"] == "OWNER-DECISION"
                 and envelope["kind"] == "decision" and envelope["status"] == "authorized"
-                and envelope["reply_to"] in {identity, event["url"]}
+                and envelope["reply_to"] == identity
                 and envelope["pull_request"] == directive["pull_request"]
                 and envelope["head_sha"] == directive["head_sha"]
                 and envelope["requested_action"] == directive["requested_action"]):
