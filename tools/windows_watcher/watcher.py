@@ -712,6 +712,17 @@ class Watcher:
         return bool(entries)
 
     def _refresh_receipts(self, state):
+        try:
+            entries = publication_tracking.discover(self.state_path.parent / "publication-receipts", self.config["repository"])
+            for entry in entries:
+                identity = entry["report_id"]
+                previous = state.get("publication_receipts", {}).get(identity)
+                if previous and any(previous[key] != entry[key] for key in ("expected_url", "approval_digest")):
+                    raise ValueError("contradictory attachment")
+                if not previous:
+                    state.setdefault("publication_receipts", {})[identity] = entry
+        except (OSError, ValueError, KeyError, TypeError):
+            raise WatcherError("Rattachement durable invalide ; aucune association remplacée.") from None
         for identity, entry in state.get("publication_receipts", {}).items():
             state["publication_receipts"][identity] = publication_tracking.assess(
                 entry, state, self.config["repository"], self.client, time.time(),
@@ -957,7 +968,12 @@ def run_simulation() -> int:
                   "issue_url": f"https://api.github.com/repos/{DEFAULT_REPOSITORY}/issues/7"}
         api.comments.append(remote)
         save_state(outbox / "receipt.json", formatter.receipt(remote, manifest, body))
-        publication = watcher.import_receipt(outbox / "receipt.json", report_id, url, manifest["approval_digest"])
+        # Même remise durable qu'après une publication, mais sans aucun POST.
+        publication_tracking.stage_confirmed(outbox / "receipt.json",
+            formatter.receipt(remote, manifest, body), manifest["approval_digest"],
+            DEFAULT_REPOSITORY, state_path.parent / "publication-receipts")
+        watcher.run_once(notify=False)
+        publication = publication_tracking.view(load_state(state_path), report_id, time.time())
         board = watcher.write_dashboard()
         print(json.dumps({"résultat": result, "notifications_simulées": notifications,
                           "coordination": {"registre": len(state["coordination_registry"]),

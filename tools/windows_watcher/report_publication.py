@@ -10,10 +10,11 @@ import shutil
 import subprocess
 
 if __package__:
-    from . import coordination, watcher
+    from . import coordination, watcher, publication_tracking
 else:
     import coordination
     import watcher
+    import publication_tracking
 
 REPOSITORY = "Pince2Homard/news-telegram"
 MAX_BYTES = 12000
@@ -242,6 +243,38 @@ def deliver(directory, client, approval=None, reconcile=False):
             raise watcher.WatcherError("Résultat de publication ambigu ; rapprochement GET requis, aucun réessai.") from None
 
 
+def publish_and_track(directory, client, root, approval=None, reconcile=False, reader=None):
+    """Publication autorisée puis remise durable ; reprise watcher GET uniquement."""
+    root = Path(root)
+    config = watcher.load_config(root / "config.json")
+    if config["repository"] != REPOSITORY:
+        raise watcher.WatcherError("Installation du watcher incompatible ; aucun envoi.")
+    manifest, _ = prepared(directory)
+    saved = deliver(directory, client, approval, reconcile)
+    result = {"publication": saved, "tracking": "pending", "receipt_durable": False,
+              "next_action": "watcher --refresh"}
+    poller = watcher.Watcher(config, root / "state.json", client=reader)
+    try:
+        with watcher.single_instance_lock(root / "watcher.lock"):
+            publication_tracking.stage_confirmed(Path(directory) / "receipt.json", saved,
+                manifest["approval_digest"], REPOSITORY, root / "publication-receipts")
+        result["receipt_durable"] = True
+        poller.run_once(notify=False)
+        poller.write_dashboard()
+        result["tracking"] = publication_tracking.view(watcher.load_state(root / "state.json"), saved["report_id"], watcher.time.time())["status"]
+        if result["tracking"] == "confirmed":
+            result["next_action"] = "none"
+    except (watcher.WatcherError, OSError, ValueError, KeyError, TypeError):
+        # Le POST est confirmé, même si la remise locale échoue. Jamais de renvoi.
+        result["next_action"] = ("watcher --refresh ; ne pas republier" if result["receipt_durable"] else
+                                 "reconcile GET uniquement puis watcher --refresh ; ne pas republier")
+        try:
+            poller.write_dashboard()
+        except (watcher.WatcherError, OSError, ValueError, KeyError, TypeError):
+            pass  # Les preuves et le résultat de publication restent disponibles.
+    return result
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -251,6 +284,8 @@ def main(argv=None):
     for name in ("publish", "reconcile"):
         command = sub.add_parser(name)
         command.add_argument("--prepared", required=True, type=Path)
+        command.add_argument("--watcher-root", type=Path,
+                             default=Path(os.environ.get("LOCALAPPDATA", "~")).expanduser() / "NewsTelegramWatcher")
         if name == "publish":
             command.add_argument("--approve-digest", required=True)
     args = parser.parse_args(argv)
@@ -259,7 +294,8 @@ def main(argv=None):
             result = prepare(args.result, args.validation, args.out, args.expected_id, args.reply_to, args.author)
             print((Path(args.out) / "comment.md").read_text(encoding="utf-8"))
         else:
-            result = deliver(args.prepared, GitHubCLI(), getattr(args, "approve_digest", None), args.action == "reconcile")
+            result = publish_and_track(args.prepared, GitHubCLI(), args.watcher_root,
+                                       getattr(args, "approve_digest", None), args.action == "reconcile")
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     except (watcher.WatcherError, OSError, ValueError, KeyError, TypeError):

@@ -1,5 +1,7 @@
 """Suivi du reçu : GET seulement, sans publication distante ni authentification."""
 import copy
+import contextlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -171,3 +173,142 @@ class ReceiptTrackingTests(unittest.TestCase):
         self.reader.limited = True
         with self.assertRaises(watcher.RateLimitError): self.assess()
         self.assertEqual(len(self.reader.calls), 1)
+
+    def writer(self):
+        owner = self
+
+        class Writer:
+            posts = 0
+            ambiguous = False
+            published = False
+
+            def call(self, method, path, payload=None):
+                if method == "POST":
+                    self.posts += 1
+                    self.published = True
+                    if self.ambiguous:
+                        raise watcher.WatcherError("ambiguous")
+                    return copy.deepcopy(owner.remote)
+                if path == "/user":
+                    return {"login": "Pince2Homard"}
+                if path.endswith("/issues/7"):
+                    return {"number": 7, "html_url": f"https://github.com/{REPO}/issues/7", "state": "open"}
+                if "/issues/7/comments?" in path:
+                    return [copy.deepcopy(owner.remote)] if self.published else []
+                if "/issues/10/comments?" in path:
+                    return []
+                raise AssertionError("unexpected publication route")
+
+        return Writer()
+
+    def installation(self):
+        root = self.root / "NewsTelegramWatcher"
+        watcher.save_state(root / "config.json", watcher.default_config())
+        watcher.save_state(root / "state.json", {**watcher._empty_state(), "initialized": True})
+        return root
+
+    def test_approved_publication_automatically_attaches_and_restart_is_get_only(self):
+        self.path.unlink()
+        writer, root = self.writer(), self.installation()
+        result = publication.publish_and_track(self.path.parent, writer, root,
+            self.manifest["approval_digest"], reader=self.reader)
+        self.assertEqual(result["tracking"], "confirmed")
+        self.assertEqual(writer.posts, 1)
+        durable = root / "publication-receipts" / REPORT
+        self.assertTrue((durable / "attachment.json").exists())
+        poller = watcher.Watcher(watcher.default_config(), root / "state.json", self.reader)
+        state = watcher.load_state(root / "state.json")
+        poller.acknowledge(state["inbox"][0]["event_id"], "done")
+        cursors = copy.deepcopy(state["threads"])
+        # Disparition de l'outbox temporaire : la reprise n'en dépend plus.
+        for path in self.path.parent.iterdir(): path.unlink()
+        with patch.object(publication, "deliver", side_effect=AssertionError("no publication")):
+            poller.run_once(notify=False)
+            page = poller.write_dashboard().read_text(encoding="utf-8")
+        self.assertIn("publication confirmée", page)
+        self.assertIn(URL, page)
+        state = watcher.load_state(root / "state.json")
+        self.assertEqual(state["threads"], cursors)
+        self.assertEqual(state["inbox"][0]["status"], "done")
+        self.assertEqual(writer.posts, 1)
+
+    def test_ambiguous_publication_requires_get_reconcile_before_attachment(self):
+        self.path.unlink()
+        writer, root = self.writer(), self.installation()
+        writer.ambiguous = True
+        with self.assertRaises(watcher.WatcherError):
+            publication.publish_and_track(self.path.parent, writer, root, self.manifest["approval_digest"], reader=self.reader)
+        self.assertFalse((root / "publication-receipts").exists())
+        with self.assertRaises(watcher.WatcherError):
+            publication.publish_and_track(self.path.parent, writer, root, self.manifest["approval_digest"], reader=self.reader)
+        result = publication.publish_and_track(self.path.parent, writer, root, reconcile=True, reader=self.reader)
+        self.assertEqual(result["tracking"], "confirmed")
+        self.assertEqual(writer.posts, 1)
+
+    def test_existing_receipt_is_idempotent_and_offline_attachment_resumes(self):
+        writer, root = self.writer(), self.installation()
+        self.reader.offline = True
+        result = publication.publish_and_track(self.path.parent, writer, root, self.manifest["approval_digest"], reader=self.reader)
+        self.assertEqual(result["publication"]["status"], "confirmed")
+        self.assertEqual(result["tracking"], "pending")
+        self.assertTrue((root / "publication-receipts" / REPORT / "attachment.json").exists())
+        self.reader.offline = False
+        result = publication.publish_and_track(self.path.parent, writer, root, reconcile=True, reader=self.reader)
+        state = watcher.load_state(root / "state.json")
+        self.assertEqual(result["tracking"], "confirmed")
+        self.assertEqual(len(state["publication_receipts"]), 1)
+        self.assertEqual(writer.posts, 0)
+
+    def test_changed_or_contradictory_durable_bundle_cannot_replace_state(self):
+        writer, root = self.writer(), self.installation()
+        publication.publish_and_track(self.path.parent, writer, root, self.manifest["approval_digest"], reader=self.reader)
+        poller = watcher.Watcher(watcher.default_config(), root / "state.json", self.reader)
+        original = watcher.load_state(root / "state.json")
+        metadata = root / "publication-receipts" / REPORT / "attachment.json"
+        data = json.loads(metadata.read_text())
+        data["approval_digest"] = "0" * 64
+        watcher.save_state(metadata, data)
+        with self.assertRaises(watcher.WatcherError): poller.run_once(notify=False)
+        state = watcher.load_state(root / "state.json")
+        self.assertEqual(state["threads"], original["threads"])
+        self.assertEqual(state["publication_receipts"][REPORT]["approval_digest"], self.manifest["approval_digest"])
+        data["approval_digest"] = self.manifest["approval_digest"]
+        watcher.save_state(metadata, data)
+        (metadata.parent / "comment.md").write_text("altered", encoding="utf-8")
+        with self.assertRaises(watcher.WatcherError): poller.run_once(notify=False)
+        self.assertEqual(writer.posts, 0)
+
+    def test_missing_or_wrong_installation_blocks_before_post(self):
+        self.path.unlink()
+        writer, root = self.writer(), self.installation()
+        config = watcher.default_config()
+        config["repository"] = "other/repository"
+        watcher.save_state(root / "config.json", config)
+        with self.assertRaises(watcher.WatcherError):
+            publication.publish_and_track(self.path.parent, writer, root, self.manifest["approval_digest"], reader=self.reader)
+        self.assertEqual(writer.posts, 0)
+
+    def test_cli_uses_automatic_attachment_without_manual_identifiers(self):
+        self.path.unlink()
+        writer, root = self.writer(), self.installation()
+        with patch.object(publication, "GitHubCLI", return_value=writer), \
+                patch.object(watcher, "GitHubReader", return_value=self.reader), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            code = publication.main(["publish", "--prepared", str(self.path.parent),
+                "--approve-digest", self.manifest["approval_digest"], "--watcher-root", str(root)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["tracking"], "confirmed")
+        self.assertEqual(writer.posts, 1)
+
+    def test_local_storage_failure_never_disguises_confirmed_post_or_retries(self):
+        self.path.unlink()
+        writer, root = self.writer(), self.installation()
+        with patch.object(tracking, "stage_confirmed", side_effect=OSError("disk unavailable")):
+            result = publication.publish_and_track(self.path.parent, writer, root,
+                self.manifest["approval_digest"], reader=self.reader)
+        self.assertEqual(result["publication"]["status"], "confirmed")
+        self.assertFalse(result["receipt_durable"])
+        self.assertEqual(result["tracking"], "pending")
+        result = publication.publish_and_track(self.path.parent, writer, root, reconcile=True, reader=self.reader)
+        self.assertEqual(result["tracking"], "confirmed")
+        self.assertEqual(writer.posts, 1)

@@ -297,3 +297,31 @@ result.json et comment.md) sont conservées atomiquement sous
 publication-receipts/UUID, pour ne pas dépendre du nettoyage du dossier temporaire
 d'origine. Aucune donnée runtime n'est copiée. Une copie existante différente
 est refusée sans écrasement ; les pièces sources restent intactes.
+
+### Remise automatique après publication approuvée (Phase 7.8)
+
+Le chemin CLI `publish` / `reconcile` appelle désormais le moteur de publication
+existant puis une remise locale durable. L'approbation reste liée au digest
+exact de la préparation ; la publication factice conserve toutes ses restrictions.
+Le registre n'appelle jamais le publicateur. Le fichier local `attachment.json`
+contient uniquement report_id, expected_url, approval_digest et bundle_hashes.
+Son répertoire UUID et les quatre empreintes sont contrôlés à chaque découverte.
+Il ne constitue ni une directive ni une approbation : le contenu distant exact,
+l'auteur, la destination et l'unicité dans le registre sont encore vérifiés par GET.
+
+Sous le verrou du watcher, les pièces identiques peuvent être réutilisées ; une
+copie incompatible ou une autre ancre pour le même UUID sont refusées sans
+écrasement. Les nouveaux rattachements sont traités avec le relevé transactionnel
+existant : aucun curseur ni accusé n'est réinitialisé. Une interruption après la
+remise durable est reprise au prochain refresh, sans dépendance à l'outbox.
+
+Une confirmation POST suivie d'une erreur locale reste une publication confirmée
+avec suivi en attente. La sortie receipt_durable précise si la remise a été
+conservée. Sinon, garder l'outbox et utiliser reconcile GET uniquement. Aucun
+échec de copie, de réseau ou de régénération HTML n'autorise une republication.
+Les anciennes préparations restent liées à l'empreinte du publicateur utilisé :
+une mise à jour du code ne renouvelle pas une ancienne autorisation. Les anciens
+reçus déjà suivis restent vérifiables sans cette dépendance au binaire actuel.
+
+Cette phase ne met pas automatiquement à jour l'installation Windows, ne crée
+aucune tâche, ne lance aucun assistant et ne publie aucun nouvel essai GitHub.

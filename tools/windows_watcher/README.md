@@ -183,3 +183,42 @@ et limites dans [PROTOCOL.md](PROTOCOL.md). Un rapport publié peut rester marqu
 obsolète pour son SHA : l'existence d'un commentaire n'est pas une validation du
 code. Les données antérieures de configuration, curseurs et traitement restent
 conservées lors de la mise à jour de l'application.
+
+## Rattachement automatique (Phase 7.8)
+
+Après `publish` explicitement approuvé, ou `reconcile` en lecture seule, le
+publicateur conserve le reçu et ses trois pièces sous
+`%LOCALAPPDATA%\NewsTelegramWatcher\publication-receipts\UUID`. Un fichier
+`attachment.json` associe les empreintes et ancres approuvées à ces pièces.
+Il actualise ensuite le registre et le tableau par GET, sans notification ni
+préparation de mission. Aucun UUID, URL ou chemin de reçu n'est à ressaisir.
+`--watcher-root` permet seulement de sélectionner une installation isolée ; la
+configuration de cette installation doit déjà exister et désigner ce dépôt.
+
+La sortie distingue `publication.status`, `tracking` et `receipt_durable`.
+Si le POST est confirmé mais le réseau empêche le suivi, les pièces durables
+restent disponibles : un prochain `watcher.py --refresh` les découvre et les
+vérifie. Si `receipt_durable` vaut faux (erreur disque, conflit ou verrou),
+conserver l'outbox source et utiliser exclusivement `reconcile` après résolution,
+jamais un nouveau POST. Une réponse de publication ambiguë continue d'exiger un
+rapprochement GET explicite ; aucune découverte locale ne republie.
+
+`--dashboard` régénère la vue sans réseau depuis l'état suivi et les preuves
+durables. `--refresh` rattache les remises nouvelles et revalide les anciennes.
+Le rattachement n'accorde aucune autorisation d'exécuter un assistant, une
+directive ou une modification GitHub. Le publicateur reste limité à l'essai
+factice de l'issue #7 ; cette phase n'élargit pas ses destinations ni ses droits.
+
+Validation visuelle après mise à jour supervisée de l'application (sauvegarder
+configuration, état, manifeste et application avant `manage.py install`) :
+
+```powershell
+$root = Join-Path $env:LOCALAPPDATA 'NewsTelegramWatcher'
+py -3.12 "$root\app\manage.py" check
+py -3.12 "$root\app\watcher.py" --dashboard --config "$root\config.json"
+Start-Process -FilePath "$root\dashboard.html"
+```
+
+Contrôler le statut, la date du GET, le lien permanent et le SHA obsolète du
+rapport factice. Une preuve ancienne est non vérifiable jusqu'à un relevé
+manuel `--refresh`. Ne pas lancer `publish` pour cette vérification visuelle.

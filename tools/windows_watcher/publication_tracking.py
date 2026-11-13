@@ -1,6 +1,7 @@
 """Rapprochement GET uniquement. Aucun import du publicateur ni appel de processus."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import tempfile
@@ -174,3 +175,45 @@ def retain(entry, directory):
                 raise ValueError("source changed during import")
             staged.rename(target)
     return {**entry, "receipt_path": str((target / "receipt.json").absolute())}
+
+
+def stage_confirmed(path, saved, approved_digest, repository, directory):
+    """Après deliver uniquement : pièces durables, pas encore une preuve GET."""
+    entry = anchor(path, saved["report_id"], saved["url"], approved_digest, repository)
+    if _json(Path(path)) != saved or saved.get("status") != "confirmed":
+        raise ValueError("receipt mismatch")
+    entry = retain({**entry, "status": "confirmed", "bundle_hashes": _bundle_hashes(Path(path))}, directory)
+    metadata = {key: entry[key] for key in ("report_id", "expected_url", "approval_digest", "bundle_hashes")}
+    target = Path(entry["receipt_path"]).with_name("attachment.json")
+    if target.exists():
+        if _json(target) != metadata:
+            raise ValueError("attachment conflict")
+    else:
+        # Même remplacement atomique que les pièces et l'état du watcher.
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as output:
+            temporary = Path(output.name)
+            output.write(json.dumps(metadata, ensure_ascii=True).encode())
+            output.flush()
+            os.fsync(output.fileno())
+        try:
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return entry
+
+
+def discover(directory, repository):
+    """Ancres produites après confirmation ; validation distante reste obligatoire."""
+    entries = []
+    for metadata_path in sorted(Path(directory).glob("*/attachment.json")):
+        metadata = _json(metadata_path)
+        if set(metadata) != {"report_id", "expected_url", "approval_digest", "bundle_hashes"}:
+            raise ValueError("invalid attachment")
+        if metadata_path.parent.name != metadata["report_id"]:
+            raise ValueError("invalid directory")
+        path = metadata_path.with_name("receipt.json")
+        entry = anchor(path, metadata["report_id"], metadata["expected_url"], metadata["approval_digest"], repository)
+        if _bundle_hashes(path) != metadata["bundle_hashes"]:
+            raise ValueError("changed attachment bundle")
+        entries.append(entry)
+    return entries
