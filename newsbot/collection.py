@@ -1,4 +1,5 @@
 """Téléchargement RSS/Atom, parcours borné des flux et points de reprise."""
+from contextlib import nullcontext
 import json
 import time
 import feedparser
@@ -21,23 +22,57 @@ def load_feeds(path="feeds.txt"):
         ]
 
 
-def parse_feed(url, http=requests, parser=feedparser.parse, timeout=(5, 20)):
-    """Télécharge un flux avec délais de connexion et de lecture bornés."""
-    response = http.get(url, headers={"User-Agent": UA}, timeout=timeout)
-    response.raise_for_status()
-    return parser(response.content)
+def parse_feed(
+    url, http=requests, parser=feedparser.parse, timeout=(5, 20),
+    timings=None, timing_clock=time.perf_counter,
+):
+    """Consomme et ferme la réponse avant parsing ; aucun réessai ajouté."""
+    response = None
+    started = timing_clock()
+    try:
+        response = http.get(url, headers={"User-Agent": UA}, timeout=timeout)
+        response.raise_for_status()
+        content = response.content
+    finally:
+        # Les doubles historiques peuvent ne pas implémenter close().
+        if response is not None:
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()
+        if timings is not None:
+            timings["network"] = timing_clock() - started
+    started = timing_clock()
+    try:
+        return parser(content)
+    finally:
+        if timings is not None:
+            timings["parsing"] = timing_clock() - started
 
 
-def entries_for_feed(url, http=requests, parser=feedparser.parse):
+def entries_for_feed(
+    url, http=requests, parser=feedparser.parse,
+    timings=None, timing_clock=time.perf_counter,
+):
     """Récupère directement les entrées d’un flux RSS/Atom configuré."""
-    return parse_feed(url, http=http, parser=parser).entries
+    return parse_feed(
+        url, http=http, parser=parser, timings=timings, timing_clock=timing_clock,
+    ).entries
+
+
+def _log_feed_timings(url, timings, admission_seconds=None):
+    print(
+        "RSS phases |", _feed_label(url),
+        "| réseau_s:", round(timings["network"], 6),
+        "| parsing_s:", round(timings["parsing"], 6) if "parsing" in timings else "n/a",
+        "| admission_s:", round(admission_seconds, 6) if admission_seconds is not None else "n/a",
+    )
 
 
 def collect_articles(
-    feeds, state, http=requests, parser=feedparser.parse,
+    feeds, state, http=None, parser=feedparser.parse,
     budget=COLLECT_BUDGET, clock=time.monotonic, checkpoint=None,
     checkpoint_every=CHECKPOINT_EVERY, metrics=None, queue_clock=time.time,
-    max_age_seconds=None,
+    max_age_seconds=None, timing_clock=time.perf_counter,
 ):
     state.setdefault("feed_health", {})
     state.setdefault("feeds", [])
@@ -99,59 +134,76 @@ def collect_articles(
         max_age_seconds=max_age_seconds, queue_max=queue_max,
     )
 
-    for index, url in enumerate(ordered_feeds):
-        if clock() - started >= budget:
-            break
-        feed_started = clock()
-        counts["attempted"] += 1
-        try:
-            entries = entries_for_feed(url, http=http, parser=parser)
-        except Exception as exc:
-            counts["error"] += 1
-            health = state["feed_health"].setdefault(url, {"consecutive_errors": 0})
-            health["consecutive_errors"] = int(health.get("consecutive_errors", 0)) + 1
-            health["last_error"] = type(exc).__name__
-            error_duration = round(clock() - feed_started, 3)
-            status = _http_status_from_exception(exc)
-            if status is not None:
-                counts["http_error"] += 1
-            retry_after = _retry_after_seconds(exc)
-            health["last_http_status"] = status
-            health["last_error_category"] = _http_status_category(status)
-            # Log only at powers of two to limit recurring failure noise.
-            streak = health["consecutive_errors"]
-            if streak & (streak - 1) == 0:
-                print(
-                    "RSS erreur |", _feed_label(url), "|", type(exc).__name__,
-                    "| HTTP:", status if status is not None else "n/a",
-                    "| catégorie:", _http_status_category(status),
-                    "| retry_after_s:", retry_after if retry_after is not None else "n/a",
-                    "| échecs consécutifs:", streak,
-                    "| durée:", error_duration, "s",
+    # Seule la collecte possède cette session ; un transport injecté reste
+    # la propriété de l'appelant. La sortie du bloc ferme aussi les connexions
+    # si parsing, admission ou checkpoint interrompt le parcours.
+    with requests.Session() if http is None else nullcontext(http) as transport:
+        for index, url in enumerate(ordered_feeds):
+            if clock() - started >= budget:
+                break
+            feed_started = clock()
+            counts["attempted"] += 1
+            timings = {}
+            try:
+                entries = entries_for_feed(
+                    url, http=transport, parser=parser,
+                    timings=timings, timing_clock=timing_clock,
                 )
+            except Exception as exc:
+                counts["error"] += 1
+                health = state["feed_health"].setdefault(url, {"consecutive_errors": 0})
+                health["consecutive_errors"] = int(health.get("consecutive_errors", 0)) + 1
+                health["last_error"] = type(exc).__name__
+                error_duration = round(clock() - feed_started, 3)
+                status = _http_status_from_exception(exc)
+                if status is not None:
+                    counts["http_error"] += 1
+                retry_after = _retry_after_seconds(exc)
+                health["last_http_status"] = status
+                health["last_error_category"] = _http_status_category(status)
+                # Log only at powers of two to limit recurring failure noise.
+                streak = health["consecutive_errors"]
+                if streak & (streak - 1) == 0:
+                    print(
+                        "RSS erreur |", _feed_label(url), "|", type(exc).__name__,
+                        "| HTTP:", status if status is not None else "n/a",
+                        "| catégorie:", _http_status_category(status),
+                        "| retry_after_s:", retry_after if retry_after is not None else "n/a",
+                        "| échecs consécutifs:", streak,
+                        "| durée:", error_duration, "s",
+                    )
+                    _log_feed_timings(url, timings)
+                state["feed_offset"] = (offset + index + 1) % len(feeds)
+                if checkpoint:
+                    checkpoint(state, seen)
+                continue
+            finally:
+                if http is None:
+                    # requests.get() isolait auparavant les cookies de chaque flux.
+                    # Garder le pool HTTP, sans transférer de cookies au flux suivant.
+                    transport.cookies.clear()
+
+            admission_started = timing_clock()
+            queue_max, feed_added, feed_deferred = admit_feed_entries(
+                entries, state, url, was_initialized=was_initialized, seen=seen,
+                url_seen=url_seen, active_url_seen=active_url_seen, counts=counts,
+                now_epoch=now_epoch, queue_clock=queue_clock,
+                max_age_seconds=max_age_seconds, queue_max=queue_max,
+            )
+
+            admission_seconds = timing_clock() - admission_started
+            if feed_deferred:
+                counts["deferred_feeds"] += 1
+            duration = round(clock() - feed_started, 3)
+            print("RSS |", _feed_label(url), "|", "vide" if not entries else "ok",
+                  "|", len(entries), "entrée(s) | +", feed_added,
+                  "article(s) | reportés:", feed_deferred, "|", duration, "s")
+            _log_feed_timings(url, timings, admission_seconds)
+            # Le curseur pointe sur le prochain flux avant que l’état soit écrit :
+            # une interruption au flux suivant reprend sans rebalayer le préfixe.
             state["feed_offset"] = (offset + index + 1) % len(feeds)
-            if checkpoint:
+            if checkpoint and (index + 1) % max(1, checkpoint_every) == 0:
                 checkpoint(state, seen)
-            continue
-
-        queue_max, feed_added, feed_deferred = admit_feed_entries(
-            entries, state, url, was_initialized=was_initialized, seen=seen,
-            url_seen=url_seen, active_url_seen=active_url_seen, counts=counts,
-            now_epoch=now_epoch, queue_clock=queue_clock,
-            max_age_seconds=max_age_seconds, queue_max=queue_max,
-        )
-
-        if feed_deferred:
-            counts["deferred_feeds"] += 1
-        duration = round(clock() - feed_started, 3)
-        print("RSS |", _feed_label(url), "|", "vide" if not entries else "ok",
-              "|", len(entries), "entrée(s) | +", feed_added,
-              "article(s) | reportés:", feed_deferred, "|", duration, "s")
-        # Le curseur pointe sur le prochain flux avant que l’état soit écrit :
-        # une interruption au flux suivant reprend sans rebalayer le préfixe.
-        state["feed_offset"] = (offset + index + 1) % len(feeds)
-        if checkpoint and (index + 1) % max(1, checkpoint_every) == 0:
-            checkpoint(state, seen)
 
     queue_max = release_due_future_articles(
         state, seen=seen, url_seen=url_seen, active_url_seen=active_url_seen,
