@@ -1,11 +1,11 @@
 # Bilan du chantier
 
-Référence : `1dd233d` ; résultats préparés sur les branches de revue, sans fusion
-ni déploiement sur main. La PR Windows existante reste indépendante et intacte.
+Référence : `1dd233d`. Chantier clôturé après intégration et validation en
+production. La PR Windows existante reste indépendante et intacte.
 
 ## Résultat comparé
 
-| Critère | Référence | Résultat proposé |
+| Critère | Référence | Résultat intégré |
 | --- | --- | --- |
 | Responsabilités concentrées | Réseau, décisions d'articles, Telegram, état et métriques dans poster.py | poster.py orchestre ; collecte, admission, dates, doublons, publication et persistance ont leurs modules |
 | Décision d'admission isolée | Exercée via collect_articles et un transport simulé | Entrées parsées, état, index, compteurs et horloges explicites ; tests directs sans transport |
@@ -40,13 +40,17 @@ porte sur les décisions et l'état, pas sur un objectif de nombre de lignes.
 
 ## Livraison et décisions restantes
 
-Revoir les PR empilées dans cet ordre, puis re-cibler les suivantes après décision
-sur leur base : [séparation](https://github.com/Pince2Homard/news-telegram/pull/11),
-[parcours de production](https://github.com/Pince2Homard/news-telegram/pull/12),
-[documentation et CI](https://github.com/Pince2Homard/news-telegram/pull/13).
-Chaque description précise périmètre, vérifications, risques et retour arrière.
-Aucune fusion n'a été effectuée. Les commits de retrait GDATA et du simulateur
-sont distincts ; documentation et filtres CI sont aussi séparés.
+Les trois PR ont été intégrées séquentiellement, sans squash ni conflit :
+
+| PR | Commit de fusion |
+| --- | --- |
+| [#11](https://github.com/Pince2Homard/news-telegram/pull/11) | `49c84c58af3b3a88ca6c4f801ca69b0bf1f90af1` |
+| [#12](https://github.com/Pince2Homard/news-telegram/pull/12) | `71ff7f8f8a949a843ea10d2759008edc3237a703` |
+| [#13](https://github.com/Pince2Homard/news-telegram/pull/13) | `da0dddc691d9b8ef1186a5255cd94df6bd135b6c` |
+
+Les CI ont réussi après reciblage des PR suivantes, puis sur le
+[main intégré](https://github.com/Pince2Homard/news-telegram/actions/runs/43324633134).
+Aucune adaptation du code n'a nécessité de répéter les comparaisons de référence.
 
 Files, capacités, déduplication, dates et quarantaine sont conservées. Les
 [propositions fonctionnelles](functional-proposals.md) isolent les décisions
@@ -54,12 +58,31 @@ nécessitant encore mesures, validation et éventuelle migration sur copie. Les
 33 résumés historiques couvrent moins de deux jours : leur silence sur une
 protection ne démontre pas son inutilité. Le Raspberry Pi reste un chantier futur.
 
-**Aucun essai Telegram réel ni interruption volontaire n'a été provoqué.**
-Les tests n'ont donc produit aucune publication et n'ont nécessité aucune reprise
-de service. La production reste sur GitHub Actions/main ; la dernière exécution
-observée a terminé avec succès, sauvegarde distante comprise, le 12 novembre
-à 22:12:07 UTC. Son état contient 234 articles en attente, sans tampon ni
-quarantaine de dates. Ce constat est borné à cette observation.
+La validation réelle a utilisé une unique
+[exécution normale de production](https://github.com/Pince2Homard/news-telegram/actions/runs/43324648814),
+lancée sur `da0dddc691d9b8ef1186a5255cd94df6bd135b6c`, avec la concurrence
+habituelle et les articles déjà en attente du canal d'origine. Les mises à jour
+intermédiaires ne concernaient que l'état ; le code intégré est resté identique.
+
+Ce passage s'est terminé le **12 novembre 2026 à 23:08:01 UTC**
+(13 novembre à 00:08:01 à Paris) :
+
+- **16 publications confirmées**, sans message artificiel.
+- Cadence configurée de **30 s**, intervalles entre confirmations du passage de **31 s**.
+- File observée de **218 articles au départ à 202 après publication** : les
+  16 premiers ont été retirés et les 202 suivants conservés exactement dans leur ordre.
+- Sauvegarde distante réussie : `baddc879e1fca68ec4e1ae327cc45bd2bf545013`.
+- Aucun échec RSS, Telegram ou de persistance relevé pendant cette exécution.
+
+Ces volumes décrivent ce passage daté, pas une taille permanente ou actuelle de
+la file. La production poursuit son fonctionnement habituel sur GitHub Actions ;
+des passages planifiés ultérieurs ont également réussi. Aucun arrêt volontaire,
+nouveau stockage, dispositif de surveillance ou tâche planifiée n'a été ajouté.
+
+Restent différées la fusion éventuelle des files, les autres simplifications
+fonctionnelles et la migration d'hébergement. Le Raspberry Pi reste indisponible.
+La gouvernance communautaire, les étoiles et les cadeaux Premium relèvent d'un
+chantier distinct ; aucune réalisation n'est engagée ici.
 
 La livraison peut toujours être répétée après un succès Telegram suivi d'une
 sauvegarde locale ou distante échouée. Le retour arrière des lots actuels conserve
