@@ -1,0 +1,4 @@
+# Outils locaux et CI uniquement ; requirements.txt reste réservé à la production.
+ruff==0.14.0
+pip-audit==2.10.1
+coverage==7.17.2

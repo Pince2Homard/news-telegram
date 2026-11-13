@@ -3,10 +3,12 @@ name: Tests de sécurité et qualité
 on:
   push:
     branches:
-      - hardening/phase-1
-      - hardening/phase-2-operations
-      - hardening/phase-3-maintenance
-      - hardening/phase-4-reliability
+      - main
+      - 'codex/**'
+      - 'hardening/**'
+    # Toute autre modification reste couverte, y compris de futurs modules.
+    paths-ignore:
+      - state.json
   pull_request:
     branches:
       - main
@@ -29,7 +31,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      - name: Vérifier les noms et imports avec Ruff
+        run: python -m ruff check .
       - name: Vérifier la syntaxe
-        run: python -m compileall -q poster.py tests
+        run: python -m compileall -q poster.py cadence_simulator.py newsbot tools tests
       - name: Lancer les tests sans Telegram
         run: python -m unittest discover -s tests -v
+      - name: Auditer les dépendances de production et développement
+        run: python -m pip_audit -r requirements.txt -r requirements-dev.txt --progress-spinner off

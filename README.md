@@ -1,83 +1,126 @@
 # news-telegram
 
-Bot de collecte de flux RSS/Atom et de publication Telegram.
+Bot Python qui collecte des flux RSS/Atom et publie leurs nouveaux articles dans
+un canal Telegram. GitHub Actions exécute la production ; `state.json`, versionné
+dans Git, conserve les articles en attente et l'historique de déduplication.
 
-## Branches et sécurité
+## Installation
 
-- `main` est la branche de production.
-- Les branches `hardening/*` servent aux corrections et validations avant fusion.
-- Les tests automatisés n'appellent jamais l'API Telegram.
-- Le workflow de qualité vérifie les modifications et les pull requests vers `main`.
-- Le workflow de production vérifie la file toutes les 5 minutes sur `main`, avec un décalage de deux minutes après l'heure.
+Utiliser **Python 3.12**, comme les workflows du dépôt, puis installer les
+dépendances épinglées :
 
-## Configuration GitHub
-
-Secrets requis dans le dépôt :
-- `TELEGRAM_TOKEN`
-- `TELEGRAM_CHAT`
-
-Le workflow de production active explicitement `ALLOW_TELEGRAM_SEND=1` et `DRY_RUN=0`.
-Le programme reste en simulation par défaut si cette autorisation explicite manque.
-
-La cadence entre publications confirmées se configure avec la variable de dépôt
-GitHub Actions `TELEGRAM_INTERVAL_SECONDS` (entier positif, défaut `30` secondes). Cette
-variable n'est pas un secret et peut être ajustée depuis les paramètres du dépôt
-sans modifier le code. Le programme persiste l'heure Unix UTC du dernier envoi
-confirmé (`last_successful_send_at`) et l'identifiant Telegram disponible dans
-`state.json`, puis calcule la prochaine heure autorisée à chaque exécution.
-
-## Exécution locale sans publication
-
-```bash
+```sh
+python -m venv .venv
+# Linux/macOS : source .venv/bin/activate
+# PowerShell : .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+```
+
+Les URL à collecter sont dans `feeds.txt`, une par ligne ; lignes vides et
+commentaires commençant par `#` sont ignorés. Pour YouTube, utiliser directement
+`https://www.youtube.com/feeds/videos.xml?channel_id=IDENTIFIANT_CHAINE`.
+Le résolveur GDATA et son scraping ne sont plus pris en charge.
+
+## Configuration
+
+| Variable du processus | Valeur par défaut / rôle |
+| --- | --- |
+| `DRY_RUN` | `1` : simulation, sans publication ni sauvegarde d'état |
+| `ALLOW_TELEGRAM_SEND` | Absente : impose la simulation ; seule la valeur `1` autorise l'envoi |
+| `TELEGRAM_TOKEN`, `TELEGRAM_CHAT` | Requis pour publier ; secrets existants du dépôt en production |
+| `TELEGRAM_INTERVAL_SECONDS` | Entier positif, `30` : intervalle minimal entre succès confirmés |
+| `ARTICLE_MAX_AGE_HOURS` | Entier positif, `24` : fenêtre de fraîcheur des nouveaux candidats |
+| `FEEDS_FILE` | `feeds.txt` |
+| `STATE_FILE` | `state.json` |
+
+La publication exige explicitement `DRY_RUN=0` **et** `ALLOW_TELEGRAM_SEND=1`.
+`DRY_RUN=1` reste prioritaire. Le workflow de production configure ces deux
+verrous et transmet la variable de dépôt `TELEGRAM_INTERVAL_SECONDS` avec repli à
+30 s. Il conserve le défaut de 24 h pour la fraîcheur : il ne transmet pas de
+variable de dépôt `ARTICLE_MAX_AGE_HOURS`.
+
+## Utilisation
+
+Une simulation du bot télécharge les flux, applique les règles en mémoire et
+affiche les articles en attente. Elle ne contacte pas Telegram et ne sauvegarde
+pas l'état. Sous Linux/macOS :
+
+```sh
+DRY_RUN=1 ALLOW_TELEGRAM_SEND=0 python poster.py
+```
+
+Sous PowerShell :
+
+```powershell
+$env:DRY_RUN = '1'
+$env:ALLOW_TELEGRAM_SEND = '0'
 python poster.py
 ```
 
-Pour une simulation explicite :
+Le simulateur de cadence est un outil exécuté explicitement :
 
-```bash
-DRY_RUN=1 python poster.py
+```sh
+python cadence_simulator.py --state state.json
 ```
 
-Ne jamais activer l'autorisation d'envoi en local sans avoir vérifié le canal cible.
+Il lit une copie de l'état et écrit une analyse JSON sur la sortie standard,
+sans réseau, publication ni écriture d'état. Ses projections restent informatives ;
+la cadence effective du bot dépend uniquement de sa configuration.
 
 ## Tests
 
-```bash
-python -m unittest discover -s tests -v
+Outils de développement (jamais installés par le workflow de publication) :
+
+```sh
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m ruff check .
+python -m pip_audit -r requirements.txt -r requirements-dev.txt --progress-spinner off
 ```
 
-Les tests utilisent des transports simulés et ne publient aucun message Telegram.
+Les contrôles qualité n'effectuent aucun envoi Telegram. L'audit nécessite le
+réseau vers les index/avis de sécurité ; une vulnérabilité signalée fait échouer
+le contrôle, sans correction automatique. Voir le
+[bilan d'entretien](docs/repository-maintenance.md) pour le résultat initial.
 
-## Collecte et file d'attente
+Mesure locale facultative, sans seuil de couverture :
 
-- Les flux RSS/Atom sont téléchargés avec un délai de connexion de 5 s et de lecture de 20 s.
-- La collecte dispose d'un budget de 3 minutes et reprend au prochain flux après chaque point de sauvegarde. L'exécution complète du bot est plafonnée à 12 minutes, sous la limite de 14 minutes du workflow.
-- Le curseur global et le dernier article traité par flux sont écrits dans `state.json` par lots de cinq flux et à la fin de la collecte ; le curseur par flux protège aussi des doublons lorsque l'historique global de 5 000 IDs est tronqué. Le workflow de production ne crée qu'un commit d'état en fin d'exécution, comme auparavant.
-- Les publications utilisent une seule cadence, indépendante de la taille de la file. Si un nouvel envoi n'est pas autorisé avant la fin du budget restant, l'article est conservé et l'exécution se termine sans attente inutile. Si la file contient d'autres articles et que l'attente tient dans le budget, le workflow peut attendre jusqu'à 120 secondes ; les attentes plus longues sont reportées au passage suivant.
-- Les journaux de tentative Telegram indiquent l'heure UTC, le résultat HTTP, la durée et l'identifiant de message retourné par Telegram lorsqu'il est disponible. Ils n'impriment ni le token, ni le chat, ni l'URL de requête.
-- La file d'attente est plafonnée à 1 000 articles. Quand elle est pleine, les nouveaux articles sont différés et ne sont pas marqués comme vus : ils seront retentés au passage suivant.
-- Au premier démarrage, les articles déjà présents dans les flux sont initialisés silencieusement. Lorsqu'un flux est ajouté à un bot déjà initialisé, ses articles historiques sont ignorés et son article le plus récent est traité normalement ; s'il ne peut pas entrer dans une file pleine, il reste retentable.
-- Les erreurs Telegram définitives sont conservées dans la liste `erreurs`, limitée à 500 entrées.
-- Les flux YouTube par identifiant de chaîne utilisent directement le flux RSS public YouTube. L'ancien format GDATA reste pris en charge par compatibilité.
-- Les journaux de collecte donnent une durée et un résumé par flux. Les erreurs HTTP précisent le statut, une catégorie générale et le délai `Retry-After` numérique s'il existe ; les erreurs récurrentes sont suivies dans l'état. Les identifiants de journal n'exposent pas les paramètres d'URL.
-- Chaque exécution émet aussi une ligne JSON `PHASE51_METRICS` qui distingue les entrées RSS examinées, les articles découverts (nouveaux candidats valides après déduplication et amorçage), admissibles (après les politiques actives) et ajoutés. Un article admissible différé par une file pleine n'est donc pas compté comme ajouté. Elle compte aussi les doublons de mémoire d'IDs, les sauts de curseur par flux, les dates RSS disponibles, les rejets de fraîcheur (zéro tant que cette politique est désactivée), les publications, reports, tailles de file, durées et intervalles. L'âge de file utilise `queued_at`; l'âge RSS ne le remplace jamais.
-- `state.json` conserve au plus 12 petits résumés d'exécution, sans titre, URL, identifiant Telegram ni secret. Les nouveaux articles reçoivent un timestamp `queued_at`; aucune donnée de mise en file n'est inventée pour les articles déjà présents.
-- Le module `cadence_simulator.py` compare 30, 25, 20, 15 et 10 secondes. Sa capacité réserve le budget d'envoi maximal, tient compte de l'attente initiale propre à chaque intervalle et ajoute la durée d'un appel d'envoi avant chaque délai de cadence, comme `process_queue`. Sans historique, la période de workflow supposée est le cron de 300 s; sinon elle est la médiane des derniers écarts de démarrage, avec leur étendue visible. Si un lot modélisé dépasse cette période, le cycle est allongé. Toute durée de résorption est conditionnelle et explicitement non fiable; elle est absente si le budget ne permet pas d'envoyer ou si les arrivées égalent ou dépassent le débit. GitHub Actions peut retarder ou regrouper ses événements.
-- Les métriques séparent déjà les articles RSS découverts, admissibles selon les règles actuelles et réellement mis en file, et exposent un compteur de rejets par fraîcheur ainsi que la disponibilité des dates RSS. La fenêtre de fraîcheur de 24 heures reste désactivée. Aucun filtre temporel ni nouvelle politique de déduplication n'est appliqué dans cette phase.
-- Une hystérésis attend deux observations avant de changer la recommandation simulée, puis avance d'un seul palier de 5 secondes par validation. En l'absence d'historique suffisant, la simulation garde 30 secondes.
-- La recommandation de cadence reste uniquement informative en phase 5.1. Elle n'est jamais transmise à la file Telegram. La cadence effective demeure `TELEGRAM_INTERVAL_SECONDS` (30 secondes par défaut, ou la valeur explicite configurée). Le simulateur n'appelle ni réseau ni fonction d'envoi.
+```sh
+python -m coverage run --branch --source=newsbot,poster,cadence_simulator -m unittest discover -s tests
+python -m coverage report -m
+```
 
-### Limites de la planification
+```sh
+python -m unittest discover -s tests -v
+python tools/compare_reference.py
+```
 
-Le cron est décalé à `2/5 * * * *` pour éviter le début exact de l'heure et laisser la file être contrôlée plus souvent. GitHub Actions impose un minimum de cinq minutes entre les déclenchements planifiés et peut retarder ou abandonner des événements en période de charge. La cadence persistée garantit seulement qu'un succès ne sera pas suivi d'un autre avant l'intervalle configuré ; elle ne garantit pas une publication exactement toutes les deux minutes. Le groupe de concurrence `poster-production` sérialise les exécutions et conserve une file d'attente, limitée à 100 exécutions en attente.
+Les tests utilisent des transports simulés et des horloges contrôlées. La
+comparaison charge le code Git de référence `1dd233d` et utilise des états copiés
+ou synthétiques ; elle ne modifie pas l'état de production. Le commit de référence
+doit être présent dans l'historique local. Un autre commit peut être sélectionné
+avec `--reference COMMIT`.
 
-## Garantie de livraison Telegram
+## Limites essentielles
 
-La file assure une livraison « au moins une fois ». Si Telegram accepte un message puis que le processus s'interrompt avant la sauvegarde qui le retire de la file, l'article sera renvoyé après reprise et un doublon est possible. Une erreur réseau ambiguë n'est pas retentée dans le même passage, mais l'article reste en file pour la prochaine exécution. L'architecture actuelle ne garantit pas une livraison exactement une fois.
+- La cadence minimale entre succès est persistée, mais GitHub Actions ne garantit
+  pas des démarrages ni des publications à intervalles réguliers.
+- Les capacités et budgets sont bornés. Un candidat non encore conservé peut
+  disparaître du flux source avant qu'une place se libère. Un article déjà admis
+  reste en attente même s'il vieillit.
+- La livraison peut être répétée : Telegram peut accepter un message avant un
+  échec de sauvegarde locale ou distante. La reprise ne garantit pas une livraison
+  exactement une fois.
+- Un état corrompu provoque une erreur ; le bot ne le remplace pas silencieusement
+  par un état vide. La simulation n'est pas une réinitialisation.
 
-Si l'envoi est confirmé mais que l'écriture locale de `state.json` échoue, le programme s'arrête et journalise un risque de doublon. Le workflow tente ensuite de versionner l'état local ; si la sauvegarde distante échoue aussi, l'état de `main` peut rester en retard. L'identifiant de message Telegram, lorsqu'il est disponible dans la réponse, aide à réconcilier ce cas mais ne permet pas au bot de retrouver automatiquement tous les messages du canal.
+## Documentation
 
-## État persistant
-
-Pour le moment, `state.json` reste versionné dans Git afin de préserver la file et l'historique de déduplication. Son déplacement vers un stockage externe nécessite une migration dédiée et un secret supplémentaire ; ne pas supprimer le fichier Git avant validation de cette migration.
+- [Architecture et règles](docs/architecture.md) : responsabilités, transitions,
+  capacités et tests sans réseau.
+- [Exploitation et essais réels](docs/operations.md) : workflows, persistance,
+  limites de livraison et procédure d'essai borné.
+- [Reprise des anciens états](docs/state-migrations.md) : compatibilité et retour arrière.
+- [Référence du chantier](docs/maintenance-reference.md),
+  [observations disponibles](docs/maintenance-observations.md) et
+  [propositions fonctionnelles différées](docs/functional-proposals.md).
+- [Bilan et vérifications](docs/maintenance-results.md).
