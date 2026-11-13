@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import tempfile
 
 if __package__:
     from . import coordination
@@ -150,3 +151,26 @@ def view(state, identity, now):
             except (OSError, ValueError):
                 status, reason = "unverifiable", "local_receipt_changed"
     return {"status": status, "reason": reason, "url": entry["expected_url"], "checked_at": checked}
+
+
+def retain(entry, directory):
+    """Conserve uniquement les quatre pièces vérifiées, pas le dossier runtime."""
+    if entry["status"] != "confirmed" or not coordination.uuid_text(entry["report_id"]):
+        return entry
+    source = Path(entry["receipt_path"])
+    parent = Path(directory)
+    parent.mkdir(parents=True, exist_ok=True)
+    target = parent / entry["report_id"]
+    if target.exists():
+        if _bundle_hashes(target / "receipt.json") != entry["bundle_hashes"]:
+            raise ValueError("stored receipt conflict")
+    else:
+        with tempfile.TemporaryDirectory(prefix=".receipt-", dir=parent) as temp:
+            staged = Path(temp) / "bundle"
+            staged.mkdir()
+            for name in entry["bundle_hashes"]:
+                (staged / name).write_bytes(source.with_name(name).read_bytes())
+            if _bundle_hashes(staged / "receipt.json") != entry["bundle_hashes"]:
+                raise ValueError("source changed during import")
+            staged.rename(target)
+    return {**entry, "receipt_path": str((target / "receipt.json").absolute())}

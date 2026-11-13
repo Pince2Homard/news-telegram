@@ -291,3 +291,9 @@ simulation hors ligne couvre un reçu factice, sans création GitHub. Avant tout
 mise à jour locale, conserver une sauvegarde de la configuration, de l'état,
 du manifeste et de l'application. Les journaux, runtime et authentifications
 Codex ne font pas partie des données lues par le rapprochement.
+
+Après confirmation, les quatre pièces vérifiées (receipt.json, prepared.json,
+result.json et comment.md) sont conservées atomiquement sous
+publication-receipts/UUID, pour ne pas dépendre du nettoyage du dossier temporaire
+d'origine. Aucune donnée runtime n'est copiée. Une copie existante différente
+est refusée sans écrasement ; les pièces sources restent intactes.

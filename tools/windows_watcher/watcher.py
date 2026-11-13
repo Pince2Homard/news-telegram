@@ -728,7 +728,7 @@ class Watcher:
         with single_instance_lock(self.state_path.with_name("watcher.lock")):
             state = load_state(self.state_path)
             previous = state.get("publication_receipts", {}).get(identity)
-            if previous and any(previous[key] != entry[key] for key in ("expected_url", "approval_digest", "receipt_path")):
+            if previous and any(previous[key] != entry[key] for key in ("expected_url", "approval_digest")):
                 raise WatcherError("Un autre reçu est déjà associé à cet UUID ; arbitrage requis.")
             try:
                 result = publication_tracking.assess(entry, state, self.config["repository"], self.client, time.time())
@@ -739,6 +739,10 @@ class Watcher:
                 }
                 save_state(self.state_path, state)
                 raise
+            try:
+                result = publication_tracking.retain(result, self.state_path.parent / "publication-receipts")
+            except (OSError, ValueError):
+                raise WatcherError("Copie du reçu non concordante ; aucune pièce existante écrasée.") from None
             state.setdefault("publication_receipts", {})[identity] = result
             save_state(self.state_path, state)
             return publication_tracking.view(state, identity, time.time())

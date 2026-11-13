@@ -142,6 +142,9 @@ class ReceiptTrackingTests(unittest.TestCase):
         proof = poller.import_receipt(self.path, REPORT, URL, self.manifest["approval_digest"])
         self.assertEqual(proof["status"], "confirmed")
         state = watcher.load_state(path)
+        retained = Path(state["publication_receipts"][REPORT]["receipt_path"])
+        self.assertNotEqual(retained, self.path)
+        self.assertEqual(retained.read_bytes(), self.path.read_bytes())
         # Le rapport factice est obsolète pour le code, mais sa publication existe.
         self.assertEqual(coordination.rows(state, REPO, NOW)[0]["condition"], "stale_sha")
         identity = state["coordination_registry"][REPORT]["event"]["event_id"]
