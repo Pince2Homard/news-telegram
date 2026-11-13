@@ -9,6 +9,28 @@ from newsbot import persistence, publication
 
 
 class PersistencePublicationTests(unittest.TestCase):
+    def test_malformed_recovery_records_are_rejected_without_overwriting_state(self):
+        # Les structures de reprise doivent échouer explicitement, pas disparaître.
+        cases = [
+            None,
+            {"item": []},
+            {"item": {}, "uid": 42},
+            {"item": {}, "url_hash": "invalid"},
+            {"item": {}, "first_seen_at": None},
+            {"item": {}, "admitted_at": -1},
+            {"item": {}, "published_at": "invalid"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            for buffer in ("admission_buffer", "date_quarantine"):
+                for record in cases:
+                    with self.subTest(buffer=buffer, record=record):
+                        original = json.dumps({"file": [{"text": "pending"}], buffer: [record]})
+                        path.write_text(original, encoding="utf-8")
+                        with self.assertRaises(ValueError):
+                            persistence.load_state(path)
+                        self.assertEqual(path.read_text(encoding="utf-8"), original)
+
     def test_failed_atomic_replace_preserves_previous_state_and_removes_temporary(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"

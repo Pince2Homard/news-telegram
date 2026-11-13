@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import cadence_simulator
 import poster
-from newsbot import collection, persistence, admission, dates, deduplication, metrics as run_metrics, publication, settings
+from newsbot import collection, persistence, admission, metrics as run_metrics, publication
 
 
 class CadenceSimulationTests(unittest.TestCase):

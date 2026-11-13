@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import requests
 import poster
-from newsbot import collection, persistence, admission, dates, deduplication, metrics as run_metrics, publication, settings
+from newsbot import collection, persistence, admission, deduplication, publication, settings
 
 
 TEST_RSS_NOW = 1_800_000_000

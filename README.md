@@ -69,6 +69,26 @@ la cadence effective du bot dépend uniquement de sa configuration.
 
 ## Tests
 
+Outils de développement (jamais installés par le workflow de publication) :
+
+```sh
+python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m ruff check .
+python -m pip_audit -r requirements.txt -r requirements-dev.txt --progress-spinner off
+```
+
+Les contrôles qualité n'effectuent aucun envoi Telegram. L'audit nécessite le
+réseau vers les index/avis de sécurité ; une vulnérabilité signalée fait échouer
+le contrôle, sans correction automatique. Voir le
+[bilan d'entretien](docs/repository-maintenance.md) pour le résultat initial.
+
+Mesure locale facultative, sans seuil de couverture :
+
+```sh
+python -m coverage run --branch --source=newsbot,poster,cadence_simulator -m unittest discover -s tests
+python -m coverage report -m
+```
+
 ```sh
 python -m unittest discover -s tests -v
 python tools/compare_reference.py

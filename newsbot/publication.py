@@ -2,7 +2,7 @@
 import time
 from dataclasses import dataclass
 import requests
-from .settings import DEFAULT_TELEGRAM_INTERVAL_SECONDS, MAX_INLINE_CADENCE_WAIT_SECONDS, TELEGRAM_REQUEST_TIMEOUT_SECONDS, TELEGRAM_MAX_ATTEMPTS, TELEGRAM_MAX_RETRY_AFTER_SECONDS, MAX_TELEGRAM_SEND_BUDGET_SECONDS, MAX_PAR_RUN, get_telegram_interval_seconds
+from .settings import DEFAULT_TELEGRAM_INTERVAL_SECONDS as DEFAULT_TELEGRAM_INTERVAL_SECONDS, MAX_INLINE_CADENCE_WAIT_SECONDS, TELEGRAM_REQUEST_TIMEOUT_SECONDS, TELEGRAM_MAX_ATTEMPTS, TELEGRAM_MAX_RETRY_AFTER_SECONDS, MAX_TELEGRAM_SEND_BUDGET_SECONDS, MAX_PAR_RUN, get_telegram_interval_seconds
 from . import persistence
 from .admission import _drain_admission_buffer
 from .metrics import _utc_iso, _http_status_from_exception, _http_status_category, _feed_label
