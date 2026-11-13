@@ -65,8 +65,9 @@ par fil ; une édition ancienne hors de cette fenêtre dépend de son horodatage
 
 Le client fait uniquement des GET, sans authentification. GitHub autorise 60
 requêtes anonymes par heure/IP, quota partagé avec les autres programmes. Coût
-minimal d'un passage : 3 + 3 × nombre de PR ouvertes, davantage avec pagination
-et fermeture récente. 30 minutes convient pour quelques PR ; utiliser 60 minutes
+minimal d'un passage : 3 + 3 × nombre de PR ouvertes, plus 2 appels par PR
+référencée dans le registre pour les CI, davantage avec pagination, fermeture
+récente et préparation de transfert (3 relectures finales par paquet). 30 minutes convient pour quelques PR ; utiliser 60 minutes
 si l'activité augmente. La valeur JSON ne lance aucun timer à elle seule.
 
 403/429 : le prochain passage respecte Retry-After, le reset du quota quand il
@@ -120,3 +121,43 @@ Voir [PROTOCOL.md](PROTOCOL.md). Une lecture directe des liens GitHub par
 l'assistant évite le copier-coller des corps. Publier des rapports ou transférer
 vers une autre conversation exige une autorisation explicite. Aucune API d'assistant,
 clé OpenAI, lancement de CLI agent ou automatisation d'interface n'est ajouté.
+
+## Usage simplifié de coordination (Phase 7.3)
+
+Le développement ne met pas à jour l'installation validée en Phase 7.2.
+Les commandes ci-dessous supposent une mise à jour explicite de l'installation,
+après validation ; aucune tâche planifiée n'est requise.
+
+```powershell
+py -3.12 "$root\app\watcher.py" --refresh --config "$root\config.json"
+```
+
+Un seul relevé manuel collecte les références, compare les SHA, relève les CI,
+prépare les paquets de données de lecture seule admissibles et écrit dashboard.html.
+Ouvrir ensuite ce fichier local : sections rapports/revues, directives, décisions,
+éléments non vérifiés/conflits, éléments traités ou obsolètes. Les liens vont aux
+commentaires GitHub, aux contrôles CI et aux paquets locaux déjà préparés.
+Aucun navigateur ni assistant n'est ouvert automatiquement. La vue affiche la
+date du relevé et les statuts locaux/métier distincts. Les marqueurs anciens ou
+JSON invalides restent visibles séparément ; aucun corps libre n'est affiché.
+Le tableau HTML est statique, sans scripts, serveur, formulaires ou ressources
+externes. Il ne peut ni accuser réception ni déclencher une commande par clic.
+
+Sans réseau, --dashboard régénère la vue du cache ; une donnée en cache n'est
+pas une validation actuelle. --list et --ack EVENT_ID restent disponibles. Pour
+préparer une directive isolée plutôt que toutes les directives admissibles :
+
+```powershell
+py -3.12 "$root\app\watcher.py" --prepare-transfer UUID --config "$root\config.json"
+```
+
+Cette commande relit GitHub et écrit seulement transfers/UUID. Les conditions,
+le format et les limites sont précisés dans [PROTOCOL.md](PROTOCOL.md). Un UUID
+peut être copié depuis le tableau, mais le contenu du rapport/directive n'a plus
+à l'être. Les rapports restent sur GitHub, les paquets locaux n'y sont pas publiés.
+Aucune option ne lance Codex/ChatGPT ou ne confère une permission de fusion.
+
+La simulation --simulate couvre maintenant aussi registre, CI factices, tableau
+et paquet local dans un répertoire temporaire. Elle ne valide pas les interfaces
+d'un assistant réel. L'installation actuelle, sa configuration et ses curseurs
+restent intacts tant qu'une mise à jour n'est pas explicitement autorisée.

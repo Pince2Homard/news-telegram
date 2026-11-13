@@ -22,6 +22,12 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
+if __package__:
+    from . import coordination
+else:
+    import coordination
+
+
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
 DEFAULT_REPOSITORY = "Pince2Homard/news-telegram"
@@ -193,6 +199,36 @@ def load_state(path: Path) -> dict:
     for thread in state["threads"].values():
         if not isinstance(thread.get("fingerprints", {}), dict):
             raise WatcherError("Empreintes locales invalides.")
+    for field in ("coordination_registry", "pr_snapshots", "ci_snapshots"):
+        if not isinstance(state.get(field, {}), dict):
+            raise WatcherError("Registre ou instantané local invalide ; état conservé.")
+    for identity, record in state.get("coordination_registry", {}).items():
+        if (not isinstance(record, dict) or not isinstance(record.get("event"), dict)
+                or not isinstance(record.get("references"), list)
+                or type(record.get("conflict")) is not bool):
+            raise WatcherError("Entrée du registre invalide ; état conservé.")
+        event = record["event"]
+        envelope = event.get("coordination")
+        if not isinstance(envelope, dict):
+            raise WatcherError("Enveloppe locale invalide ; état conservé.")
+        canonical, error = coordination.parse_envelope(
+            "```json\n" + json.dumps(envelope) + "\n```", state.get("repository", DEFAULT_REPOSITORY),
+        )
+        if error or canonical != envelope or identity != envelope["coordination_id"]:
+            raise WatcherError("Enveloppe locale invalide ; état conservé.")
+        if (event.get("prefix") not in PREFIX_CATEGORIES
+                or not isinstance(event.get("event_id"), str)
+                or not isinstance(event.get("event_key"), str)
+                or type(event.get("authorized_author")) is not bool
+                or not coordination.github_url(event.get("url"), envelope["repository"])
+                or any(not coordination.github_url(url, envelope["repository"]) for url in record["references"])):
+            raise WatcherError("Référence du registre invalide ; état conservé.")
+    for snapshot in state.get("pr_snapshots", {}).values():
+        if not isinstance(snapshot, dict):
+            raise WatcherError("Instantané PR invalide ; état conservé.")
+    for snapshot in state.get("ci_snapshots", {}).values():
+        if not isinstance(snapshot, dict) or snapshot.get("result") not in {"success", "failure", "pending", "unknown", "incomplete"}:
+            raise WatcherError("Instantané CI invalide ; état conservé.")
     state.setdefault("initialized", False)
     migrate_history = "inbox" not in state
     inbox = state.setdefault("inbox", [])
@@ -378,7 +414,13 @@ def _event_from_comment(config: dict, thread: dict, source: str,
         ensure_ascii=True, separators=(",", ":"),
     ).encode()).hexdigest()
     identity = f"{config['repository']}:{thread['key']}:{source}:{comment_id}:{fingerprint}"
+    envelope, protocol_error = coordination.parse_envelope(comment.get("body"), config["repository"])
+    if envelope and envelope["kind"] != PREFIX_CATEGORIES[prefix]:
+        envelope, protocol_error = None, "prefix_kind_mismatch"
     return {
+        "coordination": envelope,
+        "protocol_error": protocol_error,
+        "content_digest": hashlib.sha256(comment.get("body", "").encode()).hexdigest(),
         "event_id": hashlib.sha256(identity.encode()).hexdigest()[:20],
         "status": "new",
         "event_key": (
@@ -443,12 +485,16 @@ class Watcher:
             "key": f"issue:{issue_number}", "type": "issue", "number": issue_number,
             "updated_at": issue.get("updated_at"),
         }]
+        snapshots = state.setdefault("pr_snapshots", {})
         valid_pulls = [pull for pull in pulls if isinstance(pull, dict)]
         if len(valid_pulls) > MAX_TRACKED_PRS:
             raise WatcherError("Plus de 100 PR ouvertes; relever l'intervalle avant de continuer.")
         for pull in valid_pulls:
             number = pull.get("number")
             if isinstance(number, int) and not isinstance(number, bool) and number > 0:
+                head = pull.get("head", {}).get("sha")
+                snapshots[str(number)] = {"head_sha": head if isinstance(head, str) and coordination.SHA.fullmatch(head) else None,
+                                          "closed": False}
                 threads.append({
                     "key": f"pr:{number}", "type": "pr", "number": number,
                     "updated_at": pull.get("updated_at"),
@@ -459,6 +505,7 @@ class Watcher:
             if key.startswith("pr:") and key not in active and not previous.get("closed_scanned"):
                 number = int(key.split(":")[1])
                 closed = self.client.get_json(f"{root}/pulls/{number}")
+                snapshots[str(number)] = {"head_sha": closed.get("head", {}).get("sha"), "closed": True}
                 threads.append({"key": key, "type": "pr", "number": number,
                                 "updated_at": closed.get("updated_at"), "closed_scanned": True})
         return threads
@@ -490,6 +537,11 @@ class Watcher:
                     continue
                 newest = max(newest, comment_id)
                 event = _event_from_comment(self.config, thread, source, comment)
+                if event:
+                    try:
+                        coordination.register(state, event)
+                    except ValueError:
+                        raise WatcherError("Registre de coordination plein ; curseurs conservés.") from None
                 updated = _timestamp(comment.get("updated_at") or comment.get("created_at"))
                 created = _timestamp(comment.get("created_at"))
                 version_key = event["event_key"] if event else ""
@@ -507,7 +559,7 @@ class Watcher:
                             _record_version(state, version_key)
                         continue
                     if created is not None and snapshot_updated is not None and created > snapshot_updated:
-                        if event and version_key not in state["seen_event_versions"]:
+                        if event and not event.get("coordination_duplicate") and version_key not in state["seen_event_versions"]:
                             found.append(event)
                             _record_version(state, version_key)
                     continue
@@ -519,7 +571,7 @@ class Watcher:
                 )
                 if not (is_new or is_edit):
                     continue
-                if event and version_key not in state["seen_event_versions"]:
+                if event and not event.get("coordination_duplicate") and version_key not in state["seen_event_versions"]:
                     found.append(event)
                 _record_version(state, version_key)
             cursors[source] = newest
@@ -544,14 +596,30 @@ class Watcher:
         save_state(self.state_path, state)
         return len(pending)
 
-    def run_once(self) -> dict:
+    def run_once(self, notify=True, transfer_id=None, prepare_ready=False) -> dict:
         lock_path = self.state_path.with_name("watcher.lock")
         with single_instance_lock(lock_path):
             state = load_state(self.state_path)
             if time.time() < state.get("next_poll_at", 0):
                 raise RateLimitError(state["next_poll_at"])
             try:
-                return self._run_once_locked()
+                result = self._run_once_locked(notify=notify)
+                if transfer_id:
+                    result["prepared_transfer"] = str(self._prepare_transfer_locked(transfer_id))
+                elif prepare_ready:
+                    # Préparation de données seulement, lors du relevé manuel.
+                    # Un paquet existant n'est jamais réécrit ou relancé.
+                    state = load_state(self.state_path)
+                    result["prepared_transfers"] = []
+                    for identity in state.get("coordination_registry", {}):
+                        try:
+                            coordination.packet_data(state, identity, self.config["repository"], time.time())
+                        except ValueError:
+                            continue
+                        target = self.state_path.parent / "transfers" / identity
+                        if not target.exists():
+                            result["prepared_transfers"].append(str(self._prepare_transfer_locked(identity)))
+                return result
             except RateLimitError as exc:
                 # Recharger l'état durable : aucun curseur partiel en mémoire.
                 state = load_state(self.state_path)
@@ -559,9 +627,9 @@ class Watcher:
                 save_state(self.state_path, state)
                 raise
 
-    def _run_once_locked(self) -> dict:
+    def _run_once_locked(self, notify=True) -> dict:
         state = load_state(self.state_path)
-        pending_delivered = self._deliver_pending(state)
+        pending_delivered = self._deliver_pending(state) if notify else 0
         if state.get("repository", self.config["repository"]) != self.config["repository"]:
             raise WatcherError("Le dépôt diffère de celui des curseurs; utiliser un autre dossier local.")
         state["repository"] = self.config["repository"]
@@ -572,6 +640,8 @@ class Watcher:
             new_events.extend(self._scan_thread(
                 state, thread, is_baseline=baseline,
             ))
+        self._refresh_ci(state)
+        state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
         existing_keys = {event.get("event_key") for event in state["pending_notifications"]}
         new_events = [event for event in new_events if event["event_key"] not in existing_keys]
         if len(state["pending_notifications"]) + len(new_events) > MAX_PENDING_EVENTS:
@@ -590,7 +660,7 @@ class Watcher:
         state["pending_notifications"].extend(new_events)
         state["initialized"] = True
         save_state(self.state_path, state)
-        new_count = self._deliver_pending(state)
+        new_count = self._deliver_pending(state) if notify else 0
         return {
             "baseline": baseline,
             "threads_checked": len(threads),
@@ -598,6 +668,81 @@ class Watcher:
             "notifications_delivered": new_count + pending_delivered,
             "pending_events": len(state["pending_notifications"]),
         }
+
+    def _refresh_ci(self, state):
+        ci = state.setdefault("ci_snapshots", {})
+        needed = {row["event"]["coordination"]["pull_request"]
+                  for row in state.get("coordination_registry", {}).values()}
+        for number in sorted(n for n in needed if isinstance(n, int)):
+            snapshot = state.get("pr_snapshots", {}).get(str(number), {})
+            head = snapshot.get("head_sha")
+            if not head or snapshot.get("closed"):
+                continue
+            root = f"/repos/{self.config['repository']}/commits/{head}"
+            checks = self.client.get_json(root + "/check-runs?per_page=100")
+            statuses = self.client.get_json(root + "/status?per_page=100")
+            try:
+                result = coordination.ci_summary(checks, statuses)
+            except (ValueError, TypeError, AttributeError):
+                raise WatcherError("Réponse CI invalide ; état non avancé.") from None
+            ci[head] = {"result": result, "checked_at": time.time()}
+        state["ci_snapshots"] = dict(list(ci.items())[-100:])
+
+    def _prepare_transfer_locked(self, identity):
+        state = load_state(self.state_path)
+        registry = state.get("coordination_registry", {})
+        record = registry.get(identity)
+        if not record:
+            raise WatcherError("Identifiant de coordination inconnu.")
+        try:
+            packet = coordination.packet_data(state, identity, self.config["repository"], time.time())
+        except ValueError as exc:
+            raise WatcherError(str(exc)) from None
+        event = record["event"]
+        envelope = event["coordination"]
+        root = f"/repos/{self.config['repository']}"
+        pull = self.client.get_json(f"{root}/pulls/{envelope['pull_request']}")
+        if pull.get("head", {}).get("sha") != envelope["head_sha"] or pull.get("state") != "open":
+            raise WatcherError("SHA ou état de PR modifié ; transfert refusé.")
+        # Revalider les références liées à la directive avant l'export, sans
+        # corps persistant. Une course après ces lectures reste possible :
+        # le lancement ultérieur exige une nouvelle validation humaine.
+        candidates = [event, registry[packet["owner_declaration"]]["event"]]
+        for candidate in candidates:
+            source, comment_id = candidate["source"], candidate["comment_id"]
+            if source in {"comments", "issue_comments"}:
+                path = f"{root}/issues/comments/{comment_id}"
+            elif source == "review_comments":
+                path = f"{root}/pulls/comments/{comment_id}"
+            else:
+                path = f"{root}/pulls/{candidate['number']}/reviews/{comment_id}"
+            current = self.client.get_json(path)
+            rebuilt = _event_from_comment(self.config, {"key": candidate["thread"],
+                "type": candidate["thread_type"], "number": candidate["number"]}, source, current)
+            if not rebuilt or rebuilt["event_key"] != candidate["event_key"]:
+                raise WatcherError("Commentaire modifié ou auteur différent ; transfert refusé.")
+        try:
+            return coordination.prepare_packet(state, identity, self.config["repository"],
+                                               self.state_path.parent / "transfers", time.time())
+        except ValueError as exc:
+            raise WatcherError(str(exc)) from None
+
+    def write_dashboard(self):
+        with single_instance_lock(self.state_path.with_name("watcher.lock")):
+            state = load_state(self.state_path)
+            path = self.state_path.with_name("dashboard.html")
+            content = coordination.dashboard(state, self.config["repository"], time.time(),
+                                               self.state_path.parent / "transfers")
+            # Remplacement atomique ; aucune ouverture automatique du navigateur.
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             delete=False, suffix=".html") as output:
+                temporary = Path(output.name)
+                output.write(content)
+            try:
+                os.replace(temporary, path)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return path
 
     def history(self) -> list:
         return load_state(self.state_path).get("history", [])
@@ -610,7 +755,11 @@ class Watcher:
             state = load_state(self.state_path)
             event = next((e for e in state["inbox"] if e["event_id"] == event_id), None)
             if event is None:
-                raise WatcherError("Identifiant local inconnu.")
+                event = next((dict(row["event"]) for row in state.get("coordination_registry", {}).values()
+                              if row["event"]["event_id"] == event_id), None)
+                if event is None:
+                    raise WatcherError("Identifiant local inconnu.")
+                state["inbox"].append(event)
             event["status"] = status
             event["handled_at"] = datetime.now(timezone.utc).isoformat()
             save_state(self.state_path, state)
@@ -638,17 +787,24 @@ class _SimulationClient:
     def __init__(self):
         self.issue_updated = "2026-11-11T12:00:00Z"
         self.comments = []
+        self.pulls = []
 
     def get_json(self, path):
         if path.endswith("/issues/7"):
             return {"updated_at": self.issue_updated}
+        if path.endswith("/check-runs?per_page=100"):
+            return {"total_count": 1, "check_runs": [{"status": "completed", "conclusion": "success"}]}
+        if path.endswith("/status?per_page=100"):
+            return {"total_count": 0, "statuses": []}
         raise AssertionError("endpoint inattendu en simulation")
 
     def get_pages(self, path):
         if "/pulls?state=open" in path:
-            return []
+            return list(self.pulls)
         if path.endswith("/issues/7/comments"):
             return list(self.comments)
+        if path.endswith(("/issues/10/comments", "/pulls/10/comments", "/pulls/10/reviews")):
+            return []
         raise AssertionError("endpoint inattendu en simulation")
 
 
@@ -676,7 +832,34 @@ def run_simulation() -> int:
         })
         api.issue_updated = "2026-11-11T12:01:00Z"
         result = watcher.run_once()
-        print(json.dumps({"résultat": result, "notifications_simulées": notifications}))
+        task_id = "11111111-1111-4111-8111-111111111111"
+        owner_id = "22222222-2222-4222-8222-222222222222"
+        head = "a" * 40
+        api.pulls = [{"number": 10, "head": {"sha": head}}]
+        for number, identity, kind, prefix in (
+            (1002, task_id, "task", "CHATGPT-TASK"),
+            (1003, owner_id, "decision", "OWNER-DECISION"),
+        ):
+            envelope = {"schema_version": 1, "coordination_id": identity,
+                        "repository": DEFAULT_REPOSITORY, "pull_request": 10,
+                        "head_sha": head, "kind": kind,
+                        "status": "authorized" if kind == "decision" else "proposed",
+                        "requested_action": "review_only",
+                        "reply_to": task_id if kind == "decision" else None,
+                        "evidence_urls": [], "expires_at": None}
+            api.comments.append({"id": number, "user": {"login": "Pince2Homard"},
+                                 "body": f"[{prefix}]\n```json\n{json.dumps(envelope)}\n```",
+                                 "created_at": "2026-11-11T12:02:00Z"})
+        watcher.run_once(notify=False)
+        state = load_state(state_path)
+        packet = coordination.prepare_packet(state, task_id, DEFAULT_REPOSITORY,
+                                              state_path.parent / "transfers", time.time())
+        board = watcher.write_dashboard()
+        print(json.dumps({"résultat": result, "notifications_simulées": notifications,
+                          "coordination": {"registre": len(state["coordination_registry"]),
+                                           "tableau_local": board.exists(),
+                                           "packet_files": sorted(p.name for p in packet.iterdir()),
+                                           "assistant_started": False}}))
     return 0
 
 
@@ -698,6 +881,9 @@ def main(argv=None) -> int:
     parser.add_argument("--init", action="store_true", help="crée une configuration locale d'exemple")
     parser.add_argument("--once", action="store_true", help="effectue un seul relevé GitHub")
     parser.add_argument("--simulate", action="store_true", help="test hors ligne sans écrire d'état réel")
+    parser.add_argument("--refresh", action="store_true", help="relevé, paquets de lecture seule admissibles et tableau local")
+    parser.add_argument("--dashboard", action="store_true", help="tableau local sans réseau")
+    parser.add_argument("--prepare-transfer", metavar="COORDINATION_UUID", help="prépare un dossier, sans lancer Codex")
     parser.add_argument("--list", action="store_true", help="liste locale et liens GitHub")
     parser.add_argument("--json", action="store_true", help="export structuré de la liste")
     parser.add_argument("--ack", metavar="EVENT_ID", help="accusé local, jamais une autorisation GitHub")
@@ -719,6 +905,17 @@ def main(argv=None) -> int:
         _configure_logging(data_dir)
         state_path = data_dir / "state.json"
         watcher = Watcher(config, state_path)
+        if args.prepare_transfer:
+            print(json.dumps(watcher.run_once(notify=False, transfer_id=args.prepare_transfer)))
+            print("Données préparées ; lancement d'assistant et opérations sensibles non autorisés.")
+            return 0
+        if args.refresh:
+            print(json.dumps(watcher.run_once(prepare_ready=True)))
+            print(watcher.write_dashboard())
+            return 0
+        if args.dashboard:
+            print(watcher.write_dashboard())
+            return 0
         if args.ack:
             watcher.acknowledge(args.ack, args.status)
             print("Traitement local enregistré ; aucune action GitHub autorisée ou exécutée.")
