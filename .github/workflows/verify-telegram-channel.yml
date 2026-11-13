@@ -1,0 +1,107 @@
+name: Vérifier le canal Telegram (lecture seule)
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_title:
+        description: "Titre exact du canal actuel, relevé dans Telegram avant renommage"
+        required: true
+        type: string
+      verify_configured_destination:
+        description: "Après mise à jour du secret : vérifier aussi TELEGRAM_CHAT numérique"
+        required: true
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: telegram-channel-verification
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Vérifier l'identité sans publier
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
+          EXPECTED_TITLE: ${{ inputs.expected_title }}
+          VERIFY_CONFIGURED: ${{ inputs.verify_configured_destination }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import urllib.parse
+          import urllib.request
+
+          def fail():
+              raise SystemExit("Vérification refusée : configuration, identité ou réponse Telegram invalide. Aucun envoi effectué.")
+
+          def get_chat(destination):
+              request = urllib.request.Request(
+                  "https://api.telegram.org/bot" + token + "/getChat",
+                  data=urllib.parse.urlencode({"chat_id": destination}).encode(),
+                  method="POST",
+              )
+              # Aucun corps de réponse, URL ou détail d'exception n'est journalisé.
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  raw = response.read(1_000_001)
+              if len(raw) > 1_000_000:
+                  fail()
+              payload = json.loads(raw)
+              if not isinstance(payload, dict) or payload.get("ok") is not True:
+                  fail()
+              chat = payload.get("result")
+              if not isinstance(chat, dict):
+                  fail()
+              if (chat.get("type") != "channel"
+                      or str(chat.get("username", "")).casefold() != "lebazaarcryptoculture"
+                      or chat.get("title") != title):
+                  fail()
+              identifier = chat.get("id")
+              if type(identifier) is not int or not str(identifier).startswith("-100"):
+                  fail()
+              return identifier
+
+          try:
+              token = os.environ.get("TELEGRAM_TOKEN", "")
+              title = os.environ.get("EXPECTED_TITLE", "")
+              if not token or not title.strip():
+                  fail()
+              identifier = get_chat("@LeBazaarCryptoCulture")
+              verified_configured = os.environ.get("VERIFY_CONFIGURED") == "true"
+              if verified_configured:
+                  configured = os.environ.get("TELEGRAM_CHAT", "")
+                  if (not configured.startswith("-100")
+                          or not configured[1:].isdigit()
+                          or int(configured) != identifier
+                          or get_chat(configured) != identifier):
+                      fail()
+              # Seul l'identifiant numérique vérifié est exporté, jamais les secrets.
+              # L'artefact évite de dépendre du masquage éventuel de l'ID dans les logs.
+              Path("channel-verification.json").write_text(json.dumps({
+                  "verified_channel_id": identifier,
+                  "type_username_title_verified": True,
+                  "configured_numeric_destination_verified": verified_configured,
+              }), encoding="utf-8")
+              print("Identité du canal vérifiée. Résultat disponible dans l'artefact dédié.")
+          except Exception:
+              # Les erreurs urllib peuvent contenir l'URL et donc le token.
+              fail()
+          PY
+      - name: Conserver uniquement le résultat vérifié
+        uses: actions/upload-artifact@v4
+        with:
+          name: verified-telegram-channel
+          path: channel-verification.json
+          if-no-files-found: error
+          retention-days: 1
