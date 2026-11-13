@@ -14,7 +14,7 @@ if __package__:
 else:
     import watcher
 
-FILES = ("watcher.py", "manage.py", "config.example.json", "README.md", "PROTOCOL.md", "coordination.py")
+FILES = ("watcher.py", "manage.py", "config.example.json", "README.md", "PROTOCOL.md", "coordination.py", "report_publication.py", "publication_tracking.py")
 
 
 def checked_root(root):

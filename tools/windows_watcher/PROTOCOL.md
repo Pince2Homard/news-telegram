@@ -182,3 +182,112 @@ Le prochain accord doit donc distinguer : mise à jour de l'installation locale,
 essai réel du nouveau relevé/tableau, éventuel lancement borné de Codex et éventuelle
 publication de résultats. Toute fusion/modification sensible reste une décision
 humaine spécifique, hors du périmètre des paquets de lecture seule.
+
+
+## Retour de rapport vers GitHub — Phase 7.6, préparation locale
+
+report_publication.py est un outil ponctuel distinct du processus GET du watcher.
+Aucun relevé, tâche Windows ou paquet Codex ne l'appelle. L'installation existante
+n'est pas mise à jour par le développement de cette phase.
+
+Le seul mode livré est l'essai factice : repository Pince2Homard/news-telegram,
+PR de contexte #10, SHA synthétique aaaa… et destination fixe issue #7. prepare
+lit explicitement result.json et validation.json, revalide le schéma/version,
+UUID attendu, reply_to attendu et limites ; seul envelope + summary sert au
+commentaire. Aucune exploration du dossier runtime ni lecture d'authentification.
+Les motifs de secrets connus font refuser un résumé, mais cette heuristique ne
+remplace pas la revue humaine. Mentions @ et HTML sont neutralisés. Limite de
+12000 octets UTF-8 pour le commentaire final.
+
+prepare crée result.json, comment.md et prepared.json dans un nouveau dossier.
+Le digest d'approbation lie le rapport, le corps, le compte et la destination.
+Une modification impose une nouvelle préparation/revue ; aucune publication
+n'est déclenchée par prepare. L'identité de l'auteur est vérifiée à nouveau par
+GET /user avant publication. L'authentification gh existante est réutilisée,
+aucun token n'est demandé, imprimé ou stocké par le module. Pour commenter #7,
+il faut le droit de créer un commentaire d'issue ; aucun droit de fusion/Actions
+n'est demandé. Aucun élargissement automatique des droits existants.
+
+Après une autorisation humaine distincte du corps exact et de la destination :
+
+```powershell
+python tools/windows_watcher/report_publication.py publish --prepared CHEMIN --approve-digest DIGEST_APPROUVE
+```
+
+publish vérifie le digest et le commentaire, verrouille les préparations du même
+outbox local, vérifie le compte/destination et cherche l'UUID/marqueur sur l'issue
+#7 ET la PR #10 (pagination complète bornée, sinon refus). Une occurrence exacte
+déjà publiée sur #7 est récupérée sans POST. Une occurrence ailleurs, modifiée,
+d'un autre compte ou multiple exige un arbitrage. Aucune commande de commentaire
+issue de GitHub n'est interprétée. Le corps est transmis comme JSON sur stdin à
+gh api, jamais interpolé dans une commande shell. Aucun nouveau secret.
+
+Une intention durable delivery.json est écrite AVANT l'unique appel POST. Le
+module n'a pas de boucle de retry. Timeout, interruption, réponse incohérente ou
+échec de sauvegarde du reçu => résultat non confirmé, journal conservé et tout
+nouvel envoi bloqué. Après succès confirmé, receipt.json enregistre identifiant,
+lien permanent, UUID et digest ; répéter la commande ne republie pas.
+
+Reprise sans écriture GitHub :
+
+```powershell
+python tools/windows_watcher/report_publication.py reconcile --prepared CHEMIN
+```
+
+Cette commande effectue seulement des GET : une occurrence exacte retrouvée
+permet d'enregistrer le reçu. Une absence n'est pas une preuve d'échec ; elle
+n'autorise aucun renvoi ni réinitialisation du journal. Ne pas effacer delivery.json
+pour forcer un essai. Un nouvel essai nécessiterait une décision humaine explicite.
+Le verrou est local ; il ne protège pas contre un autre PC/client indépendant.
+L'API GitHub n'offre pas ici de clé d'idempotence transactionnelle : ne pas lancer
+deux publicateurs indépendants. Aucune livraison exactement-une-fois n'est promise.
+
+Le lien permanent permet ensuite la consultation GET du commentaire par un
+assistant disposant de l'accès GitHub. Le test local simule ce parcours ; l'accès
+au commentaire réel ne peut être confirmé qu'après publication autorisée.
+Les fichiers runtime, journaux et credentials ne doivent jamais être joints.
+Aucune publication réelle ou modification distante n'est autorisée à ce stade.
+
+
+## Suivi des publications — Phase 7.7
+
+Le watcher importe un reçu avec des ancres explicitement attendues : UUID, URL
+permanente et digest approuvé. Le reçu seul n'est jamais une preuve. L'import
+relit les fils GitHub via le même client GET, vérifie l'empreinte de prepared.json,
+le rapport, le corps approuvé et le reçu, puis effectue un GET du commentaire
+exact. Auteur, UUID, enveloppe, destination et corps distant doivent concorder.
+Les doublons/conflits du registre empêchent la confirmation. Le lecteur n'importe
+pas le publicateur, n'appelle aucun processus et n'expose aucune méthode POST.
+
+```powershell
+python tools/windows_watcher/watcher.py --config CONFIG --import-receipt CHEMIN_RECEIPT --receipt-uuid UUID --receipt-url URL_ATTENDUE --receipt-digest DIGEST_APPROUVE
+```
+
+Les fichiers source du reçu ne sont jamais modifiés. Le suivi est ajouté au même
+état local sous publication_receipts, sans reset de curseur/événement/accusé. Une
+autre ancre pour le même UUID est refusée sans remplacer l'association existante.
+Un nouveau refresh revalide les reçus suivis avec des GET uniquement (un appel
+supplémentaire par reçu). Les délais API restent prioritaires, sans retry immédiat.
+Une panne du relevé invalide les confirmations en cache plutôt que de conserver
+une apparence de preuve verte. Le relevé refresh est désormais journalisé.
+
+Le tableau distingue rapport local, publication confirmée (instantané GET),
+publication incertaine (réseau/relevé non confirmé) et publication non vérifiable
+(divergence, reçu invalide, doublon ou confirmation ancienne). La date et le lien
+permanent restent visibles ; les empreintes des quatre fichiers du reçu sont
+contrôlées même dans la vue hors ligne. Après 15 minutes, une ancienne confirmation
+est affichée non vérifiable jusqu'à un nouveau GET. Ce délai est un choix local
+explicite d'affichage, pas une garantie de stabilité distante ; aucun polling
+supplémentaire n'est créé. Une course après lecture reste possible.
+
+Publication confirmée signifie seulement que le commentaire existait avec ce
+contenu à la date du GET. Cela n'approuve ni la directive ni le code : un rapport
+factice avec SHA aaaa… reste obsolète pour la PR actuelle. Les états métier, de
+traitement local et de publication sont séparés. Aucun lien n'ouvre automatiquement
+ChatGPT et aucun rapprochement n'appelle publish ou reconcile.
+
+L'essai réel utilise exclusivement le commentaire 6866188257 déjà publié. La
+simulation hors ligne couvre un reçu factice, sans création GitHub. Avant toute
+mise à jour locale, conserver une sauvegarde de la configuration, de l'état,
+du manifeste et de l'application. Les journaux, runtime et authentifications
+Codex ne font pas partie des données lues par le rapprochement.

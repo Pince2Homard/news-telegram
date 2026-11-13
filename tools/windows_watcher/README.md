@@ -161,3 +161,25 @@ La simulation --simulate couvre maintenant aussi registre, CI factices, tableau
 et paquet local dans un répertoire temporaire. Elle ne valide pas les interfaces
 d'un assistant réel. L'installation actuelle, sa configuration et ses curseurs
 restent intacts tant qu'une mise à jour n'est pas explicitement autorisée.
+
+
+## Retour vers GitHub (Phase 7.6)
+
+Le module report_publication.py prépare un commentaire factice à partir d'un
+rapport JSON validé. Il reste séparé des relevés GET et n'est jamais lancé par
+le tableau. prepare est hors ligne ; publish exige une approbation explicite du
+digest affiché ; reconcile est en GET seulement. Voir [PROTOCOL.md](PROTOCOL.md)
+pour les contrôles, permissions, doublons et résultats ambigus. Le développement
+local ne met pas à jour l'installation Windows ni la PR distante sans autorisation.
+
+
+## Suivi d'un reçu déjà publié (Phase 7.7)
+
+--import-receipt associe un reçu confirmé à un rapport du registre après contrôle
+des ancres attendues et GET du commentaire. Le tableau donne le statut de
+publication, sa date de vérification et le lien permanent ; --refresh revalide
+ces preuves. Aucune consultation ne publie quoi que ce soit. Voir les arguments
+et limites dans [PROTOCOL.md](PROTOCOL.md). Un rapport publié peut rester marqué
+obsolète pour son SHA : l'existence d'un commentaire n'est pas une validation du
+code. Les données antérieures de configuration, curseurs et traitement restent
+conservées lors de la mise à jour de l'application.

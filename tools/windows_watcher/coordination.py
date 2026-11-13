@@ -154,6 +154,10 @@ def condition(record, state, now):
 
 
 def rows(state, repository, now):
+    if __package__:
+        from .publication_tracking import view
+    else:
+        from publication_tracking import view
     result = []
     local = {event["event_id"]: event["status"] for event in state.get("inbox", [])}
     for identity, record in state.get("coordination_registry", {}).items():
@@ -162,6 +166,7 @@ def rows(state, repository, now):
         checks = state.get("ci_snapshots", {}).get(envelope["head_sha"], {})
         result.append({"coordination_id": identity, "event_id": event["event_id"],
                        "kind": envelope["kind"], "head_sha": envelope["head_sha"],
+                       "publication": view(state, identity, now),
                        "status": envelope["status"], "condition": condition(record, state, now),
                        "local_status": local.get(event["event_id"], "baseline"),
                        "reply_to": envelope["reply_to"], "source_url": event["url"],
@@ -205,6 +210,14 @@ def dashboard(state, repository, now, transfers=None):
         links = " ".join(f'<a href="{escape(url)}" rel="noreferrer">{escape(label)}</a>'
                          for label, url in (("GitHub", row["source_url"]), ("CI", row["checks_url"]))
                          if github_url(url, repository))
+        publication = row["publication"]
+        labels = {"local": "rapport local", "confirmed": "publication confirmée (instantané GET)",
+                  "uncertain": "publication incertaine", "unverifiable": "publication non vérifiable"}
+        publication_text = " — " + labels[publication["status"]] + " / " + publication["reason"]
+        if publication["checked_at"] is not None:
+            publication_text += " / vérification UTC : " + datetime.fromtimestamp(publication["checked_at"], timezone.utc).isoformat()
+        if github_url(publication["url"], repository):
+            links += f' <a href="{escape(publication["url"])}" rel="noreferrer">Publication (lien permanent)</a>'
         preparation = ""
         if row["kind"] == "task":
             try:
@@ -217,7 +230,7 @@ def dashboard(state, repository, now, transfers=None):
                 preparation = " — préparation bloquée : " + str(exc)
         groups[group].append("<li>" + escape(row["coordination_id"]) + " — " +
                              escape(f"{row['status']} / {row['condition']} / local: {row['local_status']} / CI: {row['ci']}") +
-                             escape(preparation) + "<br>SHA " + escape(row["head_sha"]) + "<br>" + links + "</li>")
+                             escape(publication_text) + escape(preparation) + "<br>SHA " + escape(row["head_sha"]) + "<br>" + links + "</li>")
     content = "".join(f"<h2>{escape(title)}</h2><ul>{''.join(items) or '<li>Aucun élément</li>'}</ul>"
                       for title, items in groups.items())
     legacy = "".join("<li>" + escape(e.get("prefix", "")) + " — " + escape(e["status"]) + " / " + escape(e.get("protocol_error", "legacy")) +

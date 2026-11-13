@@ -23,9 +23,10 @@ from urllib.request import Request, urlopen
 
 
 if __package__:
-    from . import coordination
+    from . import coordination, publication_tracking
 else:
     import coordination
+    import publication_tracking
 
 
 API_ROOT = "https://api.github.com"
@@ -199,7 +200,7 @@ def load_state(path: Path) -> dict:
     for thread in state["threads"].values():
         if not isinstance(thread.get("fingerprints", {}), dict):
             raise WatcherError("Empreintes locales invalides.")
-    for field in ("coordination_registry", "pr_snapshots", "ci_snapshots"):
+    for field in ("coordination_registry", "pr_snapshots", "ci_snapshots", "publication_receipts"):
         if not isinstance(state.get(field, {}), dict):
             raise WatcherError("Registre ou instantané local invalide ; état conservé.")
     for identity, record in state.get("coordination_registry", {}).items():
@@ -229,6 +230,16 @@ def load_state(path: Path) -> dict:
     for snapshot in state.get("ci_snapshots", {}).values():
         if not isinstance(snapshot, dict) or snapshot.get("result") not in {"success", "failure", "pending", "unknown", "incomplete"}:
             raise WatcherError("Instantané CI invalide ; état conservé.")
+    for identity, receipt in state.get("publication_receipts", {}).items():
+        try:
+            publication_tracking.anchor(receipt["receipt_path"], identity, receipt["expected_url"],
+                                        receipt["approval_digest"], state.get("repository", DEFAULT_REPOSITORY))
+            if (receipt["report_id"] != identity or receipt["status"] not in publication_tracking.STATUSES
+                    or not isinstance(receipt["checked_at"], (int, float)) or not math.isfinite(receipt["checked_at"])
+                    or not isinstance(receipt["reason"], str) or not re.fullmatch(r"[a-z_]{1,50}", receipt["reason"])):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError):
+            raise WatcherError("Suivi de publication invalide ; état conservé.") from None
     state.setdefault("initialized", False)
     migrate_history = "inbox" not in state
     inbox = state.setdefault("inbox", [])
@@ -641,7 +652,13 @@ class Watcher:
                 # Recharger l'état durable : aucun curseur partiel en mémoire.
                 state = load_state(self.state_path)
                 state["next_poll_at"] = exc.retry_at
+                self._invalidate_receipts(state, "rate_limited")
                 save_state(self.state_path, state)
+                raise
+            except WatcherError:
+                state = load_state(self.state_path)
+                if self._invalidate_receipts(state, "refresh_failed"):
+                    save_state(self.state_path, state)
                 raise
 
     def _run_once_locked(self, notify=True) -> dict:
@@ -658,6 +675,7 @@ class Watcher:
                 state, thread, is_baseline=baseline,
             ))
         self._refresh_ci(state)
+        self._refresh_receipts(state)
         state["last_poll_at"] = datetime.now(timezone.utc).isoformat()
         existing_keys = {event.get("event_key") for event in state["pending_notifications"]}
         new_events = [event for event in new_events if event["event_key"] not in existing_keys]
@@ -685,6 +703,45 @@ class Watcher:
             "notifications_delivered": new_count + pending_delivered,
             "pending_events": len(state["pending_notifications"]),
         }
+
+    @staticmethod
+    def _invalidate_receipts(state, reason):
+        entries = state.get("publication_receipts", {})
+        for entry in entries.values():
+            entry.update(status="uncertain", reason=reason, checked_at=time.time())
+        return bool(entries)
+
+    def _refresh_receipts(self, state):
+        for identity, entry in state.get("publication_receipts", {}).items():
+            state["publication_receipts"][identity] = publication_tracking.assess(
+                entry, state, self.config["repository"], self.client, time.time(),
+            )
+
+    def import_receipt(self, path, identity, url, approved_digest):
+        try:
+            entry = publication_tracking.anchor(path, identity, url, approved_digest, self.config["repository"])
+        except ValueError:
+            raise WatcherError("Ancres du reçu invalides ; aucun import.") from None
+        # Actualiser les commentaires via le parcours GET existant, sans notifier
+        # ni préparer de transfert ou appeler le publicateur.
+        self.run_once(notify=False)
+        with single_instance_lock(self.state_path.with_name("watcher.lock")):
+            state = load_state(self.state_path)
+            previous = state.get("publication_receipts", {}).get(identity)
+            if previous and any(previous[key] != entry[key] for key in ("expected_url", "approval_digest", "receipt_path")):
+                raise WatcherError("Un autre reçu est déjà associé à cet UUID ; arbitrage requis.")
+            try:
+                result = publication_tracking.assess(entry, state, self.config["repository"], self.client, time.time())
+            except RateLimitError as exc:
+                state["next_poll_at"] = exc.retry_at
+                state.setdefault("publication_receipts", {})[identity] = {
+                    **entry, "status": "uncertain", "reason": "rate_limited", "checked_at": time.time(),
+                }
+                save_state(self.state_path, state)
+                raise
+            state.setdefault("publication_receipts", {})[identity] = result
+            save_state(self.state_path, state)
+            return publication_tracking.view(state, identity, time.time())
 
     def _refresh_ci(self, state):
         ci = state.setdefault("ci_snapshots", {})
@@ -809,6 +866,9 @@ class _SimulationClient:
     def get_json(self, path):
         if path.endswith("/issues/7"):
             return {"updated_at": self.issue_updated}
+        if "/issues/comments/" in path:
+            number = int(path.rsplit("/", 1)[-1])
+            return next(comment for comment in self.comments if comment["id"] == number)
         if path.endswith("/check-runs?per_page=100"):
             return {"total_count": 1, "check_runs": [{"status": "completed", "conclusion": "success"}]}
         if path.endswith("/status?per_page=100"):
@@ -871,12 +931,35 @@ def run_simulation() -> int:
         state = load_state(state_path)
         packet = coordination.prepare_packet(state, task_id, DEFAULT_REPOSITORY,
                                               state_path.parent / "transfers", time.time())
+        if __package__:
+            from . import report_publication as formatter
+        else:
+            import report_publication as formatter
+        report_id = "33333333-3333-4333-8333-333333333333"
+        report = {"envelope": {**state["coordination_registry"][task_id]["event"]["coordination"],
+                              "coordination_id": report_id, "kind": "report", "status": "completed", "reply_to": task_id},
+                  "summary": "Simulation factice hors ligne."}
+        report_file = state_path.parent / "result.json"
+        validation_file = state_path.parent / "validation.json"
+        save_state(report_file, report)
+        save_state(validation_file, {"schema_valid": True, "ids_and_sha_valid": True,
+                                    "input_files_unchanged": True,
+                                    "execution": {"launches": 1, "exit_code": 0, "error": None}})
+        outbox = state_path.parent / "outbox"
+        manifest = formatter.prepare(report_file, validation_file, outbox, report_id, task_id, "Pince2Homard")
+        body = (outbox / "comment.md").read_text(encoding="utf-8")
+        url = f"https://github.com/{DEFAULT_REPOSITORY}/issues/7#issuecomment-1004"
+        remote = {"id": 1004, "html_url": url, "body": body, "user": {"login": "Pince2Homard"},
+                  "issue_url": f"https://api.github.com/repos/{DEFAULT_REPOSITORY}/issues/7"}
+        api.comments.append(remote)
+        save_state(outbox / "receipt.json", formatter.receipt(remote, manifest, body))
+        publication = watcher.import_receipt(outbox / "receipt.json", report_id, url, manifest["approval_digest"])
         board = watcher.write_dashboard()
         print(json.dumps({"résultat": result, "notifications_simulées": notifications,
                           "coordination": {"registre": len(state["coordination_registry"]),
                                            "tableau_local": board.exists(),
                                            "packet_files": sorted(p.name for p in packet.iterdir()),
-                                           "assistant_started": False}}))
+                                           "assistant_started": False, "publication_simulée": publication["status"]}}))
     return 0
 
 
@@ -898,6 +981,10 @@ def main(argv=None) -> int:
     parser.add_argument("--init", action="store_true", help="crée une configuration locale d'exemple")
     parser.add_argument("--once", action="store_true", help="effectue un seul relevé GitHub")
     parser.add_argument("--simulate", action="store_true", help="test hors ligne sans écrire d'état réel")
+    parser.add_argument("--import-receipt", type=Path, help="rapprochement GET d'un reçu existant")
+    parser.add_argument("--receipt-uuid")
+    parser.add_argument("--receipt-url")
+    parser.add_argument("--receipt-digest")
     parser.add_argument("--refresh", action="store_true", help="relevé, paquets de lecture seule admissibles et tableau local")
     parser.add_argument("--dashboard", action="store_true", help="tableau local sans réseau")
     parser.add_argument("--prepare-transfer", metavar="COORDINATION_UUID", help="prépare un dossier, sans lancer Codex")
@@ -922,12 +1009,21 @@ def main(argv=None) -> int:
         _configure_logging(data_dir)
         state_path = data_dir / "state.json"
         watcher = Watcher(config, state_path)
+        if args.import_receipt:
+            if not all((args.receipt_uuid, args.receipt_url, args.receipt_digest)):
+                raise WatcherError("UUID, URL et digest attendus sont obligatoires pour l'import.")
+            result = watcher.import_receipt(args.import_receipt, args.receipt_uuid, args.receipt_url, args.receipt_digest)
+            print(json.dumps(result, ensure_ascii=True))
+            print(watcher.write_dashboard())
+            return 0 if result["status"] == "confirmed" else 2
         if args.prepare_transfer:
             print(json.dumps(watcher.run_once(notify=False, transfer_id=args.prepare_transfer)))
             print("Données préparées ; lancement d'assistant et opérations sensibles non autorisés.")
             return 0
         if args.refresh:
-            print(json.dumps(watcher.run_once(prepare_ready=True)))
+            result = watcher.run_once(prepare_ready=True)
+            logging.info("refresh terminé threads=%d nouveaux=%d", result["threads_checked"], result["new_events"])
+            print(json.dumps(result))
             print(watcher.write_dashboard())
             return 0
         if args.dashboard:
