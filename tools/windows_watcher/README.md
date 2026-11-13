@@ -1,127 +1,122 @@
-# Surveillance locale GitHub — Windows 10
+# Watcher GitHub local — Phase 7.1, Windows 10
 
-Prototype en lecture seule pour les commentaires de coordination. Le programme n'appelle que des routes GitHub `GET`; aucun commentaire, log ou contenu RSS n'est interprété comme une commande. Le prototype ne lance pas Codex, n'écrit pas dans GitHub, ne touche pas au bot Telegram et ne crée pas de tâche planifiée.
+Ce watcher lit GitHub et prépare une boîte locale ; il ne lance jamais Codex,
+ChatGPT, Git ou Telegram. Les commentaires restent des données non fiables,
+y compris ceux d'un auteur connu. Aucune fusion n'est effectuée.
 
-## Architecture
+## Prérequis et vérification
 
-- Python 3.12 standard library : client REST `urllib`, sans dépendance supplémentaire ni jeton pour ce dépôt public.
-- Lecture de l'issue de coordination configurée (défaut `#7`) et des PR ouvertes. Les conversations PR, revues et commentaires en ligne sont relus lorsque la date `updated_at` du fil change.
-- Reconnaissance des préfixes `[CHATGPT-DECISION]`, `[OWNER-DECISION]`, `[CODEX-REPORT]`, `[CHATGPT-REVIEW]` et `[CHATGPT-TASK]`. Le login est comparé à une allowlist locale, par défaut `Pince2Homard`. Un auteur non autorisé est marqué « non vérifié »; le commentaire reste une donnée, jamais une instruction.
-- Curseurs numériques par fil/type, versions récentes bornées et boîte de notifications locale. L'état est écrit atomiquement sous `%LOCALAPPDATA%\NewsTelegramWatcher\state.json`; l'historique retient au plus 500 résumés sans corps de commentaire. Un verrou système exclusif empêche deux relevés simultanés et se libère à la fermeture/crash du processus.
-- Une notification WinForms `NotifyIcon` récapitule le nombre d'événements. Aucun texte de commentaire ni login n'est transmis à PowerShell. La notification est livrée après la persistance de la boîte locale.
-- `--simulate` utilise une API factice, un état temporaire et une notification factice; il n'accède pas au réseau et ne modifie pas l'état réel.
+Python **3.12**, Windows PowerShell/WinForms, accès HTTPS à api.github.com pour
+les relevés réels. Notifications : session utilisateur ouverte ; leur affichage
+reste soumis à Windows et à l'Assistant de concentration. Aucun jeton requis
+pour le dépôt public. Aucun outil de développement requis pour l'installation.
 
-Le premier relevé établit silencieusement les curseurs pour éviter un flot de notifications historiques. Les nouveaux commentaires apparaissant pendant ce relevé sont détectés au relevé suivant lorsque leur horodatage est distinct de la photographie initiale. Comme toute surveillance par polling, un commentaire ajouté dans la même seconde que le relevé initial peut se confondre avec le point de départ.
-
-## Prérequis
-
-- Windows 10 avec session utilisateur ouverte pour afficher les notifications.
-- Python 3.12 installé.
-- Accès HTTPS sortant vers `api.github.com`.
-- Dépôt public : aucune authentification ou permission GitHub n'est demandée. Les requêtes non authentifiées sont limitées à 60 par heure par adresse IP; les réponses 403/429 suspendent le relevé sans avancer les curseurs. Avec 30 minutes entre les relevés, le coût normal est de deux requêtes de métadonnées, plus jusqu'à trois routes de commentaires par PR active dont le fil a changé. Au-delà d'environ huit PR ouvertes ou lors d'une forte activité, choisir 60 minutes.
-
-## Vérification hors ligne
-
-Depuis la racine du dépôt :
-
-```powershell
-py -3.12 tools\windows_watcher\watcher.py --simulate
-py -3.12 -m unittest discover -s tests -v
-```
-
-Les tests emploient des réponses factices; ils n'effectuent aucun appel réseau, notification Windows ou planification.
-
-## Essai manuel Windows 10 sans installation permanente
-
-Cet essai se lance depuis une copie de travail du dépôt. Il n'installe rien dans le profil Windows et ne crée aucune tâche planifiée. Le test de notification est local et indépendant de GitHub; le relevé réel suivant ne fait que des requêtes GitHub `GET`.
-
-### 1. Vérifier la session Windows
-
-Ouvrir PowerShell dans une session utilisateur interactive et déverrouillée, depuis la racine du dépôt. Vérifier Python et PowerShell :
+Depuis la copie de développement, avec un Python dont la version est vérifiée :
 
 ```powershell
 py -3.12 --version
-Get-Command powershell.exe
-Get-Process explorer -ErrorAction SilentlyContinue | Select-Object -First 1
-```
-
-Python doit afficher 3.12.x. Si `py` ne se lance pas, vérifier `py -0p` et `Get-Command python.exe`; n'utiliser qu'un exécutable dont `--version` confirme Python 3.12. Les alias WindowsApps ne sont pas une installation Python utilisable.
-
-Dans **Paramètres > Système > Notifications et actions**, activer les notifications. Désactiver **Assistant de concentration** pour l'essai, garder la session ouverte et vérifier que la zone de notification Windows est disponible. Une stratégie de l'appareil peut masquer les bulles même si le programme retourne un code de succès.
-
-Le programme utilise WinForms `NotifyIcon.ShowBalloonTip` pour afficher une bulle dans la zone de notification. Windows peut ajuster sa durée selon les paramètres d'accessibilité et n'affiche qu'une bulle à la fois; les 10 secondes demandées par le code ne constituent donc pas une durée garantie. Voir la [documentation Microsoft de `ShowBalloonTip`](https://learn.microsoft.com/en-us/dotnet/api/system.windows.forms.notifyicon.showballoontip?view=windowsdesktop-10.0), les [paramètres de notifications Windows](https://support.microsoft.com/en-us/windows/experience/notifications-and-do-not-disturb-in-windows) et [Assistant de concentration](https://support.microsoft.com/en-us/windows/experience/focus-stay-on-task-without-distractions).
-
-### 2. Vérifier la simulation sans effet système
-
-```powershell
 py -3.12 tools\windows_watcher\watcher.py --simulate
+py -3.12 tools\windows_watcher\manage.py install
+py -3.12 tools\windows_watcher\manage.py check
 ```
 
-Cette commande utilise une API factice et une notification factice. Elle ne contacte pas GitHub et ne doit pas afficher de notification Windows.
+Les commandes sont à exécuter explicitement par l'utilisateur, pas par les tests.
+`install` copie seulement les fichiers connus vers
+`%LOCALAPPDATA%\NewsTelegramWatcher\app`, crée la configuration si absente et
+conserve configuration, état et journaux existants. Pour une mise à jour,
+réexécuter install depuis la copie de développement. Un manifeste conserve les
+empreintes des fichiers et le chemin absolu de Python ; ne pas supprimer cet
+interpréteur. Préférer Python installé durablement à un venv de travail.
+`check` contrôle ces fichiers, Python, la configuration et l'état sans réseau,
+sans notification, sans écriture et sans réparation automatique. Ses avertissements
+sur la session interactive ne constituent pas une preuve d'affichage.
 
-### 3. Vérifier une notification Windows réelle
+## Relevé et traitement local
 
 ```powershell
-py -3.12 -c "from tools.windows_watcher.watcher import show_windows_notification; print(show_windows_notification(1))"
+$root = Join-Path $env:LOCALAPPDATA 'NewsTelegramWatcher'
+py -3.12 "$root\app\watcher.py" --once --config "$root\config.json"
+py -3.12 "$root\app\watcher.py" --list --config "$root\config.json"
+py -3.12 "$root\app\watcher.py" --list --json --config "$root\config.json"
+py -3.12 "$root\app\watcher.py" --ack IDENTIFIANT --status acknowledged --config "$root\config.json"
+py -3.12 "$root\app\watcher.py" --ack IDENTIFIANT --status done --config "$root\config.json"
 ```
 
-Une bulle générique de coordination avec le compteur `1` doit apparaître près de la zone de notification. Cette commande n'appelle pas GitHub, n'écrit aucun état et n'envoie rien à Telegram. Le résultat `True` signifie que PowerShell s'est terminé sans erreur; il ne prouve pas que Windows a effectivement affiché la bulle. Confirmer visuellement l'affichage. Si elle manque, vérifier l'Assistant de concentration, les notifications Windows, la session déverrouillée et les stratégies locales avant de poursuivre.
+`ignored` est également disponible. Les statuts locaux sont `new`,
+`acknowledged`, `done`, `ignored`. Aucun ne vaut approbation d'une directive ou
+permission GitHub. La liste donne identifiant, statut, préfixe, classification
+de l'auteur et lien ; elle ne copie pas le corps des commentaires. L'export JSON
+permet de transmettre les références à un assistant sans recopier les rapports.
+`--history` conserve le journal récent des notifications, distinct du traitement.
+La livraison d'une bulle ne retire pas l'événement de la boîte à traiter.
 
-### 4. Tester le relevé GitHub avec un état temporaire
+Le premier relevé est un baseline silencieux. Le code relit ensuite les sources
+de commentaires même si la date du fil n'a pas changé : les empreintes détectent
+les éditions dans la même seconde. Un dernier relevé est fait pour une PR suivie
+qui vient de fermer ; les commentaires ultérieurs à ce dernier relevé ne sont
+pas surveillés. Seuls les préfixes du [protocole](PROTOCOL.md) sont notifiés,
+pas les corps des PR/issues ni les résultats CI. Les anciennes installations
+schema_version=1 sont reprises sans effacer leurs curseurs. Les anciennes éditions
+sans empreinte reçoivent un point de départ ; leur ancien contenu ne peut pas
+être reconstruit. La comparaison d'empreintes garde les 4096 derniers commentaires
+par fil ; une édition ancienne hors de cette fenêtre dépend de son horodatage.
 
-Créer un dossier temporaire neuf pour isoler la configuration, les journaux et les curseurs :
+## Quota, interruptions et erreurs
+
+Le client fait uniquement des GET, sans authentification. GitHub autorise 60
+requêtes anonymes par heure/IP, quota partagé avec les autres programmes. Coût
+minimal d'un passage : 3 + 3 × nombre de PR ouvertes, davantage avec pagination
+et fermeture récente. 30 minutes convient pour quelques PR ; utiliser 60 minutes
+si l'activité augmente. La valeur JSON ne lance aucun timer à elle seule.
+
+403/429 : le prochain passage respecte Retry-After, le reset du quota quand il
+est épuisé et au moins 60 secondes. L'échéance est persistée sans avancer de
+curseurs partiels. Aucun réessai immédiat ; 50 requêtes maximum par processus.
+Une réponse réussie épuisant le quota empêche la requête suivante. Une longue
+pagination dépassant ce budget peut empêcher un cycle complet : diagnostiquer
+ce cas avant de prévoir une authentification séparée. Les autres erreurs réseau
+sont reportées au prochain lancement, sans effacer l'état.
+
+Les écritures sont atomiques et les relevés/accusés sont verrouillés. Au plus
+1000 événements non terminés sont conservés ; la saturation arrête la progression
+plutôt que de les jeter. Les 500 derniers événements terminés et 500 notifications
+sont conservés. Un crash après affichage mais avant sauvegarde peut répéter une
+notification ; l'identifiant d'événement et le traitement local restent séparés.
+Les journaux UTC tournent sous watcher.log (512 Ko, deux sauvegardes).
+
+## Planification préparée, jamais activée
 
 ```powershell
-$testRoot = Join-Path $env:TEMP 'NewsTelegramWatcher-PR10'
-if (Test-Path -LiteralPath $testRoot) { throw "Le dossier existe déjà; choisissez un autre nom : $testRoot" }
-New-Item -ItemType Directory -Path $testRoot | Out-Null
-Copy-Item .\tools\windows_watcher\config.example.json (Join-Path $testRoot 'config.json')
+py -3.12 tools\windows_watcher\manage.py prepare-task
 ```
 
-Effectuer un relevé unique :
+Cette commande produit seulement `task.disabled.xml` dans le dossier local :
+tâche **et déclencheur désactivés**, ouverture de session de l'utilisateur courant,
+répétition selon config.json, droits ordinaires, chemins absolus, concurrence
+IgnoreNew et limite 15 minutes. Elle n'appelle aucun outil d'enregistrement de tâche.
+Une modification d'intervalle nécessite de régénérer le XML.
+
+L'importation dans le Planificateur, la vérification de l'identité et l'activation
+nécessitent une autorisation distincte. Nom conseillé : NewsTelegramGitHubWatcher.
+Après autorisation, un essai visuel et un relevé réel GET seront nécessaires avant
+de déclarer le fonctionnement Windows validé de bout en bout.
+
+## Désinstallation conservatrice
+
+Désactiver et supprimer d'abord toute tâche importée dans le Planificateur, puis :
 
 ```powershell
-py -3.12 tools\windows_watcher\watcher.py --once --config (Join-Path $testRoot 'config.json')
+py -3.12 tools\windows_watcher\manage.py uninstall
 ```
 
-Il effectue un baseline silencieux et des requêtes HTTPS `GET` sur le dépôt public. L'état et les journaux restent sous `$testRoot`; aucun jeton ni droit d'écriture GitHub n'est utilisé. Ce premier relevé ne devrait pas notifier les anciens commentaires.
+Seuls les fichiers d'application connus, le manifeste et le XML sont supprimés.
+Aucune suppression récursive ; configuration, état, journaux et éventuels fichiers
+inconnus restent présents. La commande ne manipule pas le Planificateur. Archiver
+ces données si nécessaire ; leur purge n'est pas incluse.
 
-Sans publier de commentaire de test, relancer manuellement la même commande après l'apparition naturelle d'un nouveau rapport/décision/revue portant un préfixe reconnu. Un nouvel événement doit produire la notification générique. Un commentaire modifié peut aussi être détecté si le fil est actualisé. Sans tâche planifiée, rien ne s'exécute entre deux lancements manuels. Une erreur réseau ou une réponse 403/429 doit laisser les curseurs inchangés; ne pas enchaîner les relances en cas de limitation.
+## Coordination
 
-Pour examiner l'historique local et le journal sans afficher le corps des commentaires :
-
-```powershell
-py -3.12 tools\windows_watcher\watcher.py --history --config (Join-Path $testRoot 'config.json')
-Get-Content (Join-Path $testRoot 'watcher.log') -Tail 30
-```
-
-Après vérification, supprimer uniquement le dossier temporaire créé pour cet essai, si son contenu n'est plus nécessaire :
-
-```powershell
-Remove-Item -LiteralPath $testRoot -Recurse -Confirm
-```
-
-Ne pas créer de tâche dans le Planificateur Windows durant cette validation. L'essai du ballon est réel, mais le test de bout en bout dépend d'un nouvel événement GitHub réel apparaissant après le baseline.
-
-## Installation manuelle (aucune tâche planifiée)
-
-Ces étapes ne sont pas exécutées par Codex. Les faire seulement après validation du propriétaire :
-
-1. Copier `tools\windows_watcher` vers `%LOCALAPPDATA%\NewsTelegramWatcher\app`.
-2. Copier `config.example.json` vers `%LOCALAPPDATA%\NewsTelegramWatcher\config.json`. Vérifier le dépôt, l'issue, les auteurs autorisés et l'intervalle `poll_interval_minutes`.
-3. Exécuter d'abord `py -3.12 watcher.py --simulate` depuis le dossier `app`.
-4. Pour le premier relevé réel en lecture seule, exécuter `py -3.12 watcher.py --once --config "%LOCALAPPDATA%\NewsTelegramWatcher\config.json"`. Il établit un baseline silencieux; les passages suivants créent des notifications et un historique consultable avec `--history`.
-
-Le watcher n'a pas de mode d'installation de tâche. Après validation séparée, l'utilisateur peut créer une tâche dans le Planificateur Windows : exécuter seulement lorsque l'utilisateur est connecté; déclencheur à l'ouverture de session, répétition de 30 minutes indéfiniment (60 minutes si plus de huit PR ouvertes), action `python.exe` avec les arguments `watcher.py --once --config <chemin-config>`, et démarrage depuis le dossier `app`. Activer « démarrer dès que possible après un démarrage planifié manqué »; ne pas demander l'élévation administrateur. Cette tâche affiche seulement des notifications et exécute uniquement ce script fixe.
-
-## Désinstallation
-
-Après arrêt de la tâche par l'utilisateur, ouvrir le Planificateur Windows, supprimer `NewsTelegramGitHubWatcher`, puis supprimer le dossier `%LOCALAPPDATA%\NewsTelegramWatcher\app`. Garder ou sauvegarder `state.json` si une réinstallation doit reprendre ses curseurs. Pour effacer aussi la configuration, l'historique et l'état, supprimer le dossier `%LOCALAPPDATA%\NewsTelegramWatcher` après vérification de son chemin.
-
-## Limites / arbitrages
-
-- Les notifications sont un résumé; les détails sont dans `--history` et le lien GitHub. Le premier baseline est silencieux.
-- L'état local protège des doublons usuels et reprend les notifications restées en attente. Une interruption exactement après l'affichage Windows mais avant l'accusé de réception local peut répéter une notification; une livraison exactement-une-fois n'est pas garantie par Windows.
-- Les PR fermées ne sont plus interrogées. Pour les suivre à nouveau, elles doivent être rouvertes ou ajoutées dans une évolution du prototype.
-- Le jeton GitHub n'est pas nécessaire pour le dépôt public. Si le dépôt devenait privé, concevoir séparément le stockage d'un jeton à portée minimale dans le Gestionnaire d'identifiants Windows.
-- Les notifications locales indiquent l'auteur autorisé ou non, mais aucun contenu n'est approuvé automatiquement. Les arbitrages sensibles restent manuels.
+Voir [PROTOCOL.md](PROTOCOL.md). Une lecture directe des liens GitHub par
+l'assistant évite le copier-coller des corps. Publier des rapports ou transférer
+vers une autre conversation exige une autorisation explicite. Aucune API d'assistant,
+clé OpenAI, lancement de CLI agent ou automatisation d'interface n'est ajouté.

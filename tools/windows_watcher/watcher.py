@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import time
+from email.utils import parsedate_to_datetime
 from contextlib import contextmanager
 import json
 import logging
+import math
 from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
@@ -60,6 +64,30 @@ $icon.Dispose()
 
 class WatcherError(RuntimeError):
     """Safe operational error; response bodies and comment text are omitted."""
+
+
+class RateLimitError(WatcherError):
+    def __init__(self, retry_at):
+        self.retry_at = retry_at
+        super().__init__(f"GitHub différé jusqu’à epoch {retry_at:.0f}; curseurs conservés.")
+
+
+def _retry_at(headers, now):
+    deadlines = [now + 60]
+    retry = headers.get("Retry-After")
+    try:
+        deadlines.append(now + max(0, int(retry)))
+    except (TypeError, ValueError):
+        try:
+            deadlines.append(parsedate_to_datetime(retry).timestamp())
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if headers.get("X-RateLimit-Remaining") == "0":
+        try:
+            deadlines.append(float(headers.get("X-RateLimit-Reset")) + 1)
+        except (TypeError, ValueError):
+            pass
+    return max(value for value in deadlines if math.isfinite(value))
 
 
 def default_data_dir() -> Path:
@@ -122,6 +150,7 @@ def _empty_state() -> dict:
         "pending_notifications": [],
         "seen_event_versions": [],
         "history": [],
+        "inbox": [],
     }
 
 
@@ -158,7 +187,31 @@ def load_state(path: Path) -> dict:
     state["history"] = state["history"][-MAX_HISTORY_EVENTS:]
     if len(state["pending_notifications"]) > MAX_PENDING_EVENTS:
         raise WatcherError("Boîte locale trop grande; aucun événement n'a été supprimé.")
+    retry_at = state.get("next_poll_at", 0)
+    if isinstance(retry_at, bool) or not isinstance(retry_at, (int, float)) or not math.isfinite(retry_at) or retry_at < 0:
+        raise WatcherError("Échéance API invalide.")
+    for thread in state["threads"].values():
+        if not isinstance(thread.get("fingerprints", {}), dict):
+            raise WatcherError("Empreintes locales invalides.")
     state.setdefault("initialized", False)
+    migrate_history = "inbox" not in state
+    inbox = state.setdefault("inbox", [])
+    if not isinstance(inbox, list) or any(not isinstance(e, dict) for e in inbox):
+        raise WatcherError("Boîte locale invalide; aucune réinitialisation.")
+    for event in inbox + state["history"] + state["pending_notifications"]:
+        if not isinstance(event.get("event_key"), str) or not isinstance(event.get("url"), str):
+            raise WatcherError("Référence d'événement invalide ; état conservé.")
+    by_key = {e.get("event_key"): e for e in inbox}
+    for event in (state["history"] if migrate_history else []) + state["pending_notifications"]:
+        by_key.setdefault(event.get("event_key"), dict(event))
+    state["inbox"] = list(by_key.values())
+    for event in state["inbox"]:
+        event.setdefault("event_id", hashlib.sha256(str(event.get("event_key")).encode()).hexdigest()[:20])
+        event.setdefault("status", "new")
+        if event["status"] not in {"new", "acknowledged", "done", "ignored"}:
+            raise WatcherError("Statut local inconnu.")
+    if sum(e["status"] in {"new", "acknowledged"} for e in state["inbox"]) > MAX_PENDING_EVENTS:
+        raise WatcherError("Boîte non traitée trop grande; aucun événement supprimé.")
     return state
 
 
@@ -222,10 +275,18 @@ def single_instance_lock(path: Path):
 class GitHubReader:
     """Anonymous, GET-only GitHub REST client for this public repository."""
 
-    def __init__(self, timeout: int = REQUEST_TIMEOUT_SECONDS):
+    def __init__(self, timeout: int = REQUEST_TIMEOUT_SECONDS, clock=time.time):
         self.timeout = timeout
+        self.clock = clock
+        self.next_request_at = 0
+        self.requests_made = 0
 
     def get_json(self, path: str):
+        if self.clock() < self.next_request_at:
+            raise RateLimitError(self.next_request_at)
+        if self.requests_made >= 50:
+            raise RateLimitError(self.clock() + 3600)
+        self.requests_made += 1
         if not path.startswith("/repos/") or ".." in path or path.startswith("//"):
             raise WatcherError("Chemin API refusé.")
         request = Request(
@@ -239,10 +300,15 @@ class GitHubReader:
         )
         try:
             with urlopen(request, timeout=self.timeout) as response:
+                headers = getattr(response, "headers", {})
+                if headers.get("X-RateLimit-Remaining") == "0":
+                    self.next_request_at = _retry_at(headers, self.clock())
                 return json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
+            if exc.code in (403, 429):
+                raise RateLimitError(_retry_at(exc.headers or {}, self.clock())) from None
             raise WatcherError(f"GitHub API HTTP {exc.code}; état non avancé.") from None
-        except (URLError, TimeoutError, OSError, json.JSONDecodeError):
+        except (URLError, TimeoutError, OSError, UnicodeError, json.JSONDecodeError):
             raise WatcherError("GitHub API inaccessible ou réponse invalide; état non avancé.") from None
 
     def get_pages(self, path: str) -> list:
@@ -307,10 +373,17 @@ def _event_from_comment(config: dict, thread: dict, source: str,
     comment_id = comment.get("id")
     if isinstance(comment_id, bool) or not isinstance(comment_id, int) or comment_id < 1:
         return None
+    fingerprint = hashlib.sha256(json.dumps(
+        [comment.get("body"), author, comment.get("updated_at"), comment.get("state")],
+        ensure_ascii=True, separators=(",", ":"),
+    ).encode()).hexdigest()
+    identity = f"{config['repository']}:{thread['key']}:{source}:{comment_id}:{fingerprint}"
     return {
+        "event_id": hashlib.sha256(identity.encode()).hexdigest()[:20],
+        "status": "new",
         "event_key": (
             f"{thread['key']}:{source}:{comment_id}:"
-            f"{comment.get('updated_at') or comment.get('created_at') or ''}"
+            f"{comment.get('updated_at') or comment.get('created_at') or ''}:{fingerprint}"
         ),
         "thread": thread["key"],
         "number": thread["number"],
@@ -358,7 +431,7 @@ class Watcher:
         self.client = client or GitHubReader()
         self.notifier = notifier or show_windows_notification
 
-    def _fetch_threads(self) -> list:
+    def _fetch_threads(self, state) -> list:
         repository = self.config["repository"]
         issue_number = self.config["coordination_issue"]
         root = f"/repos/{repository}"
@@ -380,6 +453,14 @@ class Watcher:
                     "key": f"pr:{number}", "type": "pr", "number": number,
                     "updated_at": pull.get("updated_at"),
                 })
+        # Un dernier relevé des PR suivies qui viennent de fermer.
+        active = {thread["key"] for thread in threads}
+        for key, previous in state["threads"].items():
+            if key.startswith("pr:") and key not in active and not previous.get("closed_scanned"):
+                number = int(key.split(":")[1])
+                closed = self.client.get_json(f"{root}/pulls/{number}")
+                threads.append({"key": key, "type": "pr", "number": number,
+                                "updated_at": closed.get("updated_at"), "closed_scanned": True})
         return threads
 
     def _scan_thread(self, state: dict, thread: dict, is_baseline: bool) -> list:
@@ -388,6 +469,8 @@ class Watcher:
         prior_updated = _timestamp(prior.get("updated_at"))
         snapshot_updated = _timestamp(thread.get("updated_at"))
         cursors = prior.setdefault("cursors", {})
+        fingerprints = prior.get("fingerprints", {})
+        next_fingerprints = {}
         found = []
         for source, path in _sources_for_thread(repository, thread).items():
             entries = self.client.get_pages(path)
@@ -409,7 +492,12 @@ class Watcher:
                 event = _event_from_comment(self.config, thread, source, comment)
                 updated = _timestamp(comment.get("updated_at") or comment.get("created_at"))
                 created = _timestamp(comment.get("created_at"))
-                version_key = f"{thread['key']}:{source}:{comment_id}:{comment.get('updated_at') or comment.get('created_at')}"
+                version_key = event["event_key"] if event else ""
+                item_key = f"{source}:{comment_id}"
+                # Même un commentaire sans préfixe reçoit une empreinte :
+                # l'ajout ultérieur d'un marqueur dans la même seconde est visible.
+                digest = hashlib.sha256(json.dumps(comment, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+                next_fingerprints[item_key] = digest
 
                 if is_baseline:
                     # Quietly establish a baseline. A comment later than the
@@ -425,7 +513,7 @@ class Watcher:
                     continue
 
                 is_new = comment_id > high_water
-                is_edit = (
+                is_edit = (item_key in fingerprints and fingerprints[item_key] != digest) or (
                     prior_updated is not None and updated is not None
                     and updated > prior_updated
                 )
@@ -436,6 +524,8 @@ class Watcher:
                 _record_version(state, version_key)
             cursors[source] = newest
         state["threads"][thread["key"]] = {
+            "fingerprints": dict(list(next_fingerprints.items())[-MAX_SEEN_VERSIONS:]),
+            "closed_scanned": thread.get("closed_scanned", False),
             "updated_at": thread.get("updated_at"), "cursors": cursors,
         }
         return found
@@ -457,22 +547,28 @@ class Watcher:
     def run_once(self) -> dict:
         lock_path = self.state_path.with_name("watcher.lock")
         with single_instance_lock(lock_path):
-            return self._run_once_locked()
+            state = load_state(self.state_path)
+            if time.time() < state.get("next_poll_at", 0):
+                raise RateLimitError(state["next_poll_at"])
+            try:
+                return self._run_once_locked()
+            except RateLimitError as exc:
+                # Recharger l'état durable : aucun curseur partiel en mémoire.
+                state = load_state(self.state_path)
+                state["next_poll_at"] = exc.retry_at
+                save_state(self.state_path, state)
+                raise
 
     def _run_once_locked(self) -> dict:
         state = load_state(self.state_path)
         pending_delivered = self._deliver_pending(state)
-        threads = self._fetch_threads()
+        if state.get("repository", self.config["repository"]) != self.config["repository"]:
+            raise WatcherError("Le dépôt diffère de celui des curseurs; utiliser un autre dossier local.")
+        state["repository"] = self.config["repository"]
+        threads = self._fetch_threads(state)
         baseline = not state.get("initialized", False)
         new_events = []
         for thread in threads:
-            previous = state["threads"].get(thread["key"])
-            is_new_thread = previous is None
-            changed = (
-                is_new_thread or thread.get("updated_at") != previous.get("updated_at")
-            )
-            if not changed:
-                continue
             new_events.extend(self._scan_thread(
                 state, thread, is_baseline=baseline,
             ))
@@ -480,6 +576,17 @@ class Watcher:
         new_events = [event for event in new_events if event["event_key"] not in existing_keys]
         if len(state["pending_notifications"]) + len(new_events) > MAX_PENDING_EVENTS:
             raise WatcherError("Trop d'événements en attente; état et curseurs non sauvegardés.")
+        inbox = state.setdefault("inbox", [])
+        known = {e["event_key"] for e in inbox}
+        inbox.extend(e for e in new_events if e["event_key"] not in known)
+        open_events = [e for e in inbox if e["status"] in {"new", "acknowledged"}]
+        if len(open_events) > MAX_PENDING_EVENTS:
+            raise WatcherError("Boîte non traitée pleine; curseurs non sauvegardés.")
+        handled = [e for e in inbox if e["status"] in {"done", "ignored"}]
+        state["inbox"] = handled[-MAX_HISTORY_EVENTS:] + open_events
+        state.pop("next_poll_at", None)
+        if getattr(self.client, "next_request_at", 0) > time.time():
+            state["next_poll_at"] = self.client.next_request_at
         state["pending_notifications"].extend(new_events)
         state["initialized"] = True
         save_state(self.state_path, state)
@@ -496,6 +603,22 @@ class Watcher:
         return load_state(self.state_path).get("history", [])
 
 
+    def acknowledge(self, event_id, status):
+        if status not in {"acknowledged", "done", "ignored"}:
+            raise WatcherError("Statut de traitement invalide.")
+        with single_instance_lock(self.state_path.with_name("watcher.lock")):
+            state = load_state(self.state_path)
+            event = next((e for e in state["inbox"] if e["event_id"] == event_id), None)
+            if event is None:
+                raise WatcherError("Identifiant local inconnu.")
+            event["status"] = status
+            event["handled_at"] = datetime.now(timezone.utc).isoformat()
+            save_state(self.state_path, state)
+
+    def events(self):
+        return load_state(self.state_path)["inbox"]
+
+
 def show_windows_notification(event_count: int) -> bool:
     if os.name != "nt" or event_count < 1:
         return False
@@ -504,6 +627,7 @@ def show_windows_notification(event_count: int) -> bool:
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-STA", "-Command", _POWERSHELL_BALLOON],
             input=f"{int(event_count)}\n", text=True, capture_output=True,
             timeout=REQUEST_TIMEOUT_SECONDS, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -561,6 +685,7 @@ def _configure_logging(data_dir: Path) -> None:
     handler = RotatingFileHandler(
         data_dir / "watcher.log", maxBytes=512_000, backupCount=2, encoding="utf-8",
     )
+    logging.Formatter.converter = time.gmtime
     logging.basicConfig(
         level=logging.INFO, handlers=[handler],
         format="%(asctime)sZ %(levelname)s %(message)s",
@@ -573,6 +698,10 @@ def main(argv=None) -> int:
     parser.add_argument("--init", action="store_true", help="crée une configuration locale d'exemple")
     parser.add_argument("--once", action="store_true", help="effectue un seul relevé GitHub")
     parser.add_argument("--simulate", action="store_true", help="test hors ligne sans écrire d'état réel")
+    parser.add_argument("--list", action="store_true", help="liste locale et liens GitHub")
+    parser.add_argument("--json", action="store_true", help="export structuré de la liste")
+    parser.add_argument("--ack", metavar="EVENT_ID", help="accusé local, jamais une autorisation GitHub")
+    parser.add_argument("--status", choices=["acknowledged", "done", "ignored"], default="acknowledged")
     parser.add_argument("--history", action="store_true", help="affiche l'historique local récent")
     args = parser.parse_args(argv)
     try:
@@ -590,6 +719,21 @@ def main(argv=None) -> int:
         _configure_logging(data_dir)
         state_path = data_dir / "state.json"
         watcher = Watcher(config, state_path)
+        if args.ack:
+            watcher.acknowledge(args.ack, args.status)
+            print("Traitement local enregistré ; aucune action GitHub autorisée ou exécutée.")
+            return 0
+        if args.list:
+            events = watcher.events()
+            if args.json:
+                print(json.dumps(events, ensure_ascii=True, indent=2))
+            else:
+                for event in events:
+                    print(event["event_id"], event["status"], event.get("prefix", ""),
+                          "auteur connu" if event.get("authorized_author") else "non vérifié")
+                    print("  " + event["url"])
+                print(f"{len(events)} événement(s) ; accusé local distinct d'une validation humaine.")
+            return 0
         if args.history:
             for event in watcher.history():
                 print(json.dumps(event, ensure_ascii=False, sort_keys=True))
@@ -604,7 +748,7 @@ def main(argv=None) -> int:
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
-    except WatcherError as exc:
+    except (WatcherError, OSError) as exc:
         logging.error("surveillance différée: %s", exc)
         print(str(exc), file=sys.stderr)
         return 2

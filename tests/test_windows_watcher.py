@@ -1,10 +1,14 @@
 import json
+from contextlib import redirect_stdout
+import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+from urllib.error import HTTPError
+from xml.etree import ElementTree as ET
 
-from tools.windows_watcher import watcher
+from tools.windows_watcher import manage, watcher
 
 
 REPOSITORY = "Pince2Homard/news-telegram"
@@ -230,6 +234,165 @@ class WindowsWatcherTests(unittest.TestCase):
     def test_simulation_is_offline_and_does_not_write_real_state(self):
         with patch.object(watcher, "show_windows_notification", side_effect=AssertionError):
             self.assertEqual(watcher.run_simulation(), 0)
+
+    def add_event(self):
+        self.poller.run_once()
+        self.client.pages[ISSUE_COMMENTS] = [comment(101, "[CODEX-REPORT] private body")]
+        self.client.issue["updated_at"] = "2026-11-11T12:00:00Z"
+        self.poller.run_once()
+        return self.poller.events()[0]["event_id"]
+
+    def test_same_second_edit_and_prefix_addition_are_detected_once(self):
+        self.poller.run_once()
+        item = comment(101, "ordinary comment")
+        self.client.pages[ISSUE_COMMENTS] = [item]
+        self.poller.run_once()
+        item["body"] = "[CODEX-REPORT] changed without metadata update"
+        self.assertEqual(self.poller.run_once()["new_events"], 1)
+        item["body"] = "[CODEX-REPORT] second edit, same timestamp"
+        self.assertEqual(self.poller.run_once()["new_events"], 1)
+        self.assertEqual(self.poller.run_once()["new_events"], 0)
+        self.assertEqual(len(self.poller.events()), 2)
+
+    def test_notification_is_not_acknowledgment_and_ack_survives_restart(self):
+        identity = self.add_event()
+        self.assertEqual(self.poller.events()[0]["status"], "new")
+        self.poller.acknowledge(identity, "acknowledged")
+        self.poller.acknowledge(identity, "done")
+        self.poller.run_once()
+        self.assertEqual(self.poller.events()[0]["status"], "done")
+        self.assertNotIn("private body", self.state_path.read_text(encoding="utf-8"))
+        with self.assertRaises(watcher.WatcherError):
+            self.poller.acknowledge(identity, "authorized")
+        with self.assertRaises(watcher.WatcherError):
+            self.poller.acknowledge("unknown", "done")
+
+    def test_empty_list_and_legacy_history_are_supported(self):
+        self.assertEqual(self.poller.events(), [])
+        self.add_event()
+        state = watcher.load_state(self.state_path)
+        state.pop("inbox")
+        watcher.save_state(self.state_path, state)
+        self.assertEqual(len(self.poller.events()), 1)
+        self.assertEqual(self.poller.events()[0]["status"], "new")
+
+    def test_list_and_ack_commands_are_local_and_export_links(self):
+        identity = self.add_event()
+        config_path = self.state_path.with_name("config.json")
+        watcher.save_state(config_path, config())
+        output = io.StringIO()
+        with patch.object(watcher, "urlopen", side_effect=AssertionError("no network")), \
+                patch.object(watcher, "_configure_logging"), redirect_stdout(output):
+            self.assertEqual(watcher.main(["--config", str(config_path), "--list", "--json"]), 0)
+            events = json.loads(output.getvalue())
+            self.assertEqual(events[0]["event_id"], identity)
+            self.assertIn("github.com/Pince2Homard/news-telegram/issues/7", events[0]["url"])
+            self.assertNotIn("private body", output.getvalue())
+            self.assertEqual(watcher.main(["--config", str(config_path), "--ack", identity,
+                                           "--status", "done"]), 0)
+        self.assertEqual(self.poller.events()[0]["status"], "done")
+
+    def test_unprocessed_inbox_full_stops_without_advancing_cursors(self):
+        self.add_event()
+        before = self.state_path.read_bytes()
+        self.client.pages[ISSUE_COMMENTS].append(comment(102, "[CODEX-REPORT] second"))
+        with patch.object(watcher, "MAX_PENDING_EVENTS", 1):
+            with self.assertRaises(watcher.WatcherError):
+                self.poller.run_once()
+        self.assertEqual(self.state_path.read_bytes(), before)
+
+    def test_rate_limit_persists_deadline_without_partial_cursors(self):
+        self.poller.run_once()
+        before = watcher.load_state(self.state_path)["threads"]
+        with patch.object(self.client, "get_pages", side_effect=watcher.RateLimitError(160)), \
+                patch.object(watcher.time, "time", return_value=100):
+            with self.assertRaises(watcher.RateLimitError):
+                self.poller.run_once()
+        self.assertEqual(watcher.load_state(self.state_path)["threads"], before)
+        with patch.object(self.client, "get_json") as read, \
+                patch.object(watcher.time, "time", return_value=150):
+            with self.assertRaises(watcher.RateLimitError):
+                self.poller.run_once()
+            read.assert_not_called()
+        with patch.object(watcher.time, "time", return_value=161):
+            self.poller.run_once()
+        self.assertNotIn("next_poll_at", watcher.load_state(self.state_path))
+
+    def test_http_limits_honor_retry_after_reset_and_do_not_retry(self):
+        reader = watcher.GitHubReader(clock=lambda: 100)
+        for code in (403, 429):
+            error = HTTPError("https://api.github.com/", code, "private", {
+                "Retry-After": "120", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "500",
+            }, None)
+            with patch.object(watcher, "urlopen", side_effect=error) as read:
+                with self.assertRaises(watcher.RateLimitError) as raised:
+                    reader.get_json(ISSUE_PATH)
+                self.assertEqual(raised.exception.retry_at, 501)
+                self.assertNotIn("private", str(raised.exception))
+                read.assert_called_once()
+        self.assertEqual(watcher._retry_at({}, 100), 160)
+        self.assertEqual(watcher._retry_at({"Retry-After": "Thu, 01 Jan 1970 00:05:00 GMT"}, 100), 300)
+
+    def test_success_exhausting_quota_blocks_next_request(self):
+        reader = watcher.GitHubReader(clock=lambda: 100)
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.headers = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "500"}
+        response.read.return_value = b'{}'
+        with patch.object(watcher, "urlopen", return_value=response) as read:
+            reader.get_json(ISSUE_PATH)
+            with self.assertRaises(watcher.RateLimitError):
+                reader.get_json(ISSUE_PATH)
+            read.assert_called_once()
+
+    def test_closed_pull_gets_one_final_scan(self):
+        self.client.pulls = [{"number": 9, "updated_at": "2026-11-11T12:00:00Z"}]
+        self.poller.run_once()
+        self.client.pulls = []
+        self.client.pages[f"/repos/{REPOSITORY}/issues/9/comments"] = [comment(200, "[CODEX-REPORT] final")]
+        original = self.client.get_json
+        with patch.object(self.client, "get_json", side_effect=lambda path: (
+            {"updated_at": "2026-11-11T13:00:00Z"} if path.endswith("/pulls/9") else original(path)
+        )):
+            self.assertEqual(self.poller.run_once()["new_events"], 1)
+        self.assertEqual(self.poller.run_once()["new_events"], 0)
+
+    def test_management_install_check_prepare_and_uninstall_are_offline(self):
+        root = Path(self.directory.name) / "NewsTelegramWatcher"
+        with patch.object(manage.subprocess, "run", side_effect=AssertionError("no task command")), \
+                patch.object(watcher, "urlopen", side_effect=AssertionError("no network")):
+            manage.install(root)
+            self.assertTrue(manage.diagnose(root)["ok"])
+            config_bytes = (root / "config.json").read_bytes()
+            watcher.save_state(root / "state.json", watcher._empty_state())
+            state_bytes = (root / "state.json").read_bytes()
+            manage.install(root)
+            with patch.dict("os.environ", {"USERNAME": "synthetic", "USERDOMAIN": "local"}):
+                result = manage.prepare_task(root)
+            self.assertFalse(result["task_registered"])
+            xml = ET.parse(root / "task.disabled.xml")
+            ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+            self.assertEqual([e.text for e in xml.findall(".//t:Enabled", ns)], ["false", "false"])
+            self.assertEqual(xml.find(".//t:RunLevel", ns).text, "LeastPrivilege")
+            self.assertIn("--once", xml.find(".//t:Arguments", ns).text)
+            unknown = root / "app" / "keep.txt"
+            unknown.write_text("keep", encoding="utf-8")
+            manage.uninstall(root)
+            self.assertTrue(unknown.exists())
+            self.assertEqual((root / "config.json").read_bytes(), config_bytes)
+            self.assertEqual((root / "state.json").read_bytes(), state_bytes)
+
+    def test_management_rejects_unsafe_root_and_preserves_corrupt_config(self):
+        with self.assertRaises(watcher.WatcherError):
+            manage.uninstall(Path(self.directory.name))
+        root = Path(self.directory.name) / "NewsTelegramWatcher"
+        manage.install(root)
+        path = root / "config.json"
+        path.write_text("{broken", encoding="utf-8")
+        self.assertFalse(manage.diagnose(root)["ok"])
+        with self.assertRaises(watcher.WatcherError):
+            manage.install(root)
+        self.assertEqual(path.read_text(encoding="utf-8"), "{broken")
 
 
 if __name__ == "__main__":
