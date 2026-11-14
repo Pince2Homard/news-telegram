@@ -21,6 +21,7 @@ try {
         rights=[int64]$_.FileSystemRights; inherit_only=(($_.PropagationFlags -band 2) -ne 0)}
     })
     $rows += @{path=$item.FullName; owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value;
+      protected=$acl.AreAccessRulesProtected;
       null_dacl=($null -eq $raw.DiscretionaryAcl); reparse=(($item.Attributes -band 1024) -ne 0); rules=$rules}
   }
   @{user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; rows=$rows} | ConvertTo-Json -Depth 8 -Compress
