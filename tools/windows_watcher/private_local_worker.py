@@ -7,6 +7,9 @@ import subprocess
 import sys
 import time
 import os
+import ctypes
+from ctypes import wintypes as w
+import re
 from uuid import UUID
 
 
@@ -24,6 +27,44 @@ def audit(event, args):
 
 PORT = 0
 GENERATION = None
+CREDENTIAL_CONSUMED = False
+
+
+def consume_fixture_pipe(raw_handle):
+    """Lecture bornée, format factice fermé, aucun fichier ni credential système."""
+    global CREDENTIAL_CONSUMED
+    kernel=ctypes.WinDLL("kernel32",use_last_error=True)
+    kernel.ReadFile.argtypes=[w.HANDLE,ctypes.c_void_p,w.DWORD,ctypes.POINTER(w.DWORD),ctypes.c_void_p]
+    kernel.ReadFile.restype=w.BOOL
+    kernel.CloseHandle.argtypes,kernel.CloseHandle.restype=[w.HANDLE],w.BOOL
+    kernel.SetHandleInformation.argtypes,kernel.SetHandleInformation.restype=[w.HANDLE,w.DWORD,w.DWORD],w.BOOL
+    handle=w.HANDLE(int(raw_handle))
+    plaintext=bytearray()
+    def read_exact(size):
+        value=bytearray(size)
+        offset=0
+        try:
+            while offset<size:
+                count=w.DWORD()
+                buffer=(ctypes.c_ubyte*(size-offset)).from_buffer(value,offset)
+                if not kernel.ReadFile(handle,buffer,size-offset,ctypes.byref(count),None) or not count.value:
+                    raise RuntimeError("SYNTHETIC_PIPE_REFUSED")
+                offset+=count.value
+            return value
+        except BaseException:
+            ctypes.memset((ctypes.c_ubyte*size).from_buffer(value),0,size)
+            raise
+    try:
+        if not kernel.SetHandleInformation(handle,1,0):raise RuntimeError("SYNTHETIC_PIPE_REFUSED")
+        length=int.from_bytes(read_exact(4),"little")
+        if not 0<length<=128:raise RuntimeError("SYNTHETIC_SIZE_REFUSED")
+        plaintext=read_exact(length)
+        if re.fullmatch(rb"C3-SYNTHETIC-[0-9a-f]{32}",plaintext) is None:
+            raise RuntimeError("SYNTHETIC_ONLY")
+        CREDENTIAL_CONSUMED=True
+    finally:
+        if plaintext:ctypes.memset((ctypes.c_ubyte*len(plaintext)).from_buffer(plaintext),0,len(plaintext))
+        kernel.CloseHandle(handle)
 
 
 def main(root):
@@ -114,6 +155,8 @@ def main(root):
                       "body": body.decode("utf-8"), "peer": "127.0.0.1", "tls": config["tls"]}
             if GENERATION is not None:
                 result["generation"] = GENERATION
+            if CREDENTIAL_CONSUMED:
+                result["credential"] = "synthetic-consumed"
             (root / "result.json").write_text(json.dumps(result), encoding="utf-8")
 
 
@@ -121,9 +164,10 @@ if __name__ == "__main__":
     if len(sys.argv)==3 and sys.argv[1]=="--descendant":
         (Path(sys.argv[2])/"descendant.json").write_text(json.dumps({"pid":os.getpid()}),encoding="utf-8")
         time.sleep(30)
-    elif len(sys.argv) == 2:
-        directory = Path(sys.argv[1]).absolute()
+    elif len(sys.argv)==2 or (len(sys.argv)==4 and sys.argv[1]=="--fixture-secret"):
+        directory = Path(sys.argv[-1]).absolute()
         try:
+            if len(sys.argv)==4:consume_fixture_pipe(sys.argv[2])
             main(directory)
         except Exception:
             # Aucun texte d'exception, corps, chemin ou environnement dans les logs.
