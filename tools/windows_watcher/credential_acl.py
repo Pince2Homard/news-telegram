@@ -1,8 +1,10 @@
 """Inspection ACL en lecture seule ; aucun credential n'est lu ici."""
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
+
+TRUSTED_INSTALLER_OWNER = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
 
 SCRIPT = r'''
 $ErrorActionPreference = 'Stop'
@@ -46,8 +48,16 @@ def validate(snapshot, paths):
         raise ValueError('incomplete ACL chain')
     # Parents : empecher remplacement, suppression enfant, changement DACL/owner.
     parent_mutation = 0x10000 | 0x40 | 0x40000 | 0x80000 | 0x100 | 0x10
+    volume_root = PureWindowsPath(str(paths[0])).anchor if paths else ''
     for index, (row, path) in enumerate(zip(rows, paths)):
-        if (os.path.normcase(row['path']) != os.path.normcase(str(path)) or row['owner'] not in trusted
+        root_owner_exception = (
+            index > 0 and index == len(paths) - 1
+            and len(volume_root) == 3 and volume_root[0].isalpha() and volume_root[1:] == ':\\'
+            and PureWindowsPath(str(path)) == PureWindowsPath(volume_root)
+            and row['owner'] == TRUSTED_INSTALLER_OWNER
+        )
+        if (os.path.normcase(row['path']) != os.path.normcase(str(path))
+                or (row['owner'] not in trusted and not root_owner_exception)
                 or row['null_dacl'] is not False or row['reparse'] is not False):
             raise ValueError('unsafe owner, DACL or link')
         for rule in row['rules']:

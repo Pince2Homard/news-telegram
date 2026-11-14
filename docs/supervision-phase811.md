@@ -1,5 +1,14 @@
 # Phase 8.1.1 — HTTP et ACL Windows, sans activation
 
+Correction ciblée Phase 8.1.4 : le SID exact
+`S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464`
+(TrustedInstaller) est accepté comme propriétaire uniquement au dernier élément
+de la chaîne, racine locale du volume du credential (par exemple `C:\`). Ce SID
+n'est ajouté ni aux propriétaires admis du fichier/dossiers ordinaires ni aux
+comptes exemptés du contrôle des ACE. Toute ACE dangereuse, DACL invalide ou
+reparse point reste refusé, y compris à cette racine. Aucune ACL Windows n'est
+modifiée par cette correction ; aucune connexion Telegram n'en découle.
+
 Cette phase remplace les blocages de préparation de la Phase 8.1. Aucun vrai
 credential n'est demandé ou lu, aucun appel Telegram n'est exécuté pendant le
 développement. L'installation Windows et les workflows restent inchangés.

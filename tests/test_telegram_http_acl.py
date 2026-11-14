@@ -3,7 +3,7 @@ import copy
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import ssl
 import tempfile
 import unittest
@@ -112,6 +112,67 @@ class ACLTests(unittest.TestCase):
         self.snapshot['rows'][1]['rules'].append(
             {'sid': 'S-1-1-0', 'allow': True, 'rights': 0x20089, 'inherit_only': False})
         acl.validate(self.snapshot, self.paths)
+
+    def root_fixture(self):
+        paths = [PureWindowsPath('C:/Users/Test/credentials/token.txt'),
+                 PureWindowsPath('C:/Users/Test/credentials'), PureWindowsPath('C:/')]
+        rows = [copy.deepcopy(self.snapshot['rows'][0]) for _ in paths]
+        for row, path in zip(rows, paths): row['path'] = str(path)
+        rows[-1]['owner'] = acl.TRUSTED_INSTALLER_OWNER
+        rows[-1]['rules'] += [
+            {'sid': 'S-1-5-11', 'allow': True, 'rights': 4, 'inherit_only': False},
+            {'sid': 'S-1-5-11', 'allow': True, 'rights': -536805376, 'inherit_only': True},
+            {'sid': 'S-1-5-32-545', 'allow': True, 'rights': 1179817, 'inherit_only': False}]
+        return {'user': self.user, 'rows': rows}, paths
+
+    def test_trustedinstaller_root_false_positive_reproduction(self):
+        data, paths = self.root_fixture()
+        acl.validate(data, paths)
+
+    def test_trustedinstaller_never_exempt_on_credential_or_ordinary_directory(self):
+        for index in (0, 1):
+            data, paths = self.root_fixture()
+            data['rows'][index]['owner'] = acl.TRUSTED_INSTALLER_OWNER
+            with self.assertRaises(ValueError): acl.validate(data, paths)
+
+    def test_root_owner_exception_is_exact_and_on_same_local_volume(self):
+        for case in ('unknown', 'similar_sid', 'other_drive', 'unc', 'credential_itself'):
+            data, paths = self.root_fixture()
+            if case == 'unknown': data['rows'][-1]['owner'] = 'S-1-1-0'
+            if case == 'similar_sid': data['rows'][-1]['owner'] += '-1'
+            if case == 'other_drive':
+                paths[-1] = PureWindowsPath('D:/')
+                data['rows'][-1]['path'] = str(paths[-1])
+            if case == 'unc':
+                paths = [PureWindowsPath('//server/share/token'), PureWindowsPath('//server/share/')]
+                data['rows'] = [data['rows'][0], data['rows'][-1]]
+                for row, path in zip(data['rows'], paths): row['path'] = str(path)
+            if case == 'credential_itself': paths, data['rows'] = paths[-1:], data['rows'][-1:]
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError): acl.validate(data, paths)
+
+    def test_root_exception_never_exempts_trustedinstaller_aces(self):
+        data, paths = self.root_fixture()
+        data['rows'][-1]['rules'].append({'sid': acl.TRUSTED_INSTALLER_OWNER,
+            'allow': True, 'rights': 0x40000, 'inherit_only': False})
+        with self.assertRaises(ValueError): acl.validate(data, paths)
+
+    def test_root_exception_keeps_dangerous_rights_and_invalid_acls_blocked(self):
+        for case in ('delete', 'delete_child', 'dacl', 'take_owner', 'null', 'reparse', 'missing', 'bad_ace', 'file_read'):
+            data, paths = self.root_fixture()
+            mask = {'delete': 0x10000, 'delete_child': 0x40, 'dacl': 0x40000, 'take_owner': 0x80000}
+            if case in mask:
+                data['rows'][-1]['rules'].append({'sid': 'S-1-1-0', 'allow': True,
+                    'rights': mask[case], 'inherit_only': False})
+            if case == 'null': data['rows'][-1]['null_dacl'] = True
+            if case == 'reparse': data['rows'][-1]['reparse'] = True
+            if case == 'missing': data['rows'].pop()
+            if case == 'bad_ace': data['rows'][-1]['rules'][0]['allow'] = 'true'
+            if case == 'file_read':
+                data['rows'][0]['rules'].append({'sid': 'S-1-1-0', 'allow': True,
+                    'rights': 1, 'inherit_only': False})
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError): acl.validate(data, paths)
 
     def test_unsafe_file_or_parent_acl_owner_reparse_null_or_incomplete(self):
         for case in ('read_file', 'write_parent', 'delete_child', 'dacl', 'owner', 'null', 'link', 'missing'):
