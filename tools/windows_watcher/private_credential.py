@@ -1,13 +1,15 @@
-"""C3 : DPAPI en mémoire et pipe hérité, uniquement secrets synthétiques fermés."""
+"""C3/F2 : DPAPI en mémoire et pipe dupliqué, secrets synthétiques fermés."""
 import ctypes
 from ctypes import wintypes as w
 from pathlib import Path
+from dataclasses import dataclass
+import json
 import os
 import re
 import subprocess
 import sys
 
-from . import private_fenced_job as fenced, private_trial as trial
+from . import coordination, private_fenced_job as fenced, private_trial as trial, private_store as base
 
 
 class CredentialError(RuntimeError):
@@ -83,8 +85,42 @@ class SyntheticVault:
         return "<SyntheticVault redacted>"
 
 
+@dataclass(frozen=True)
+class PrivateFixtureTarget:
+    target_id: str
+    bot_id: int
+    generation: str
+
+    def __post_init__(self):
+        if (not coordination.uuid_text(self.target_id) or not base._positive(self.bot_id)
+                or not coordination.uuid_text(self.generation)):
+            raise CredentialError("PRIVATE_TARGET_INVALID")
+
+
+class PinnedSyntheticProvider:
+    """Stockage DPAPI en mémoire explicite ; aucun CredRead, fichier ou fallback."""
+
+    def __init__(self,target,vault=None,*,enabled=False):
+        if type(target) is not PrivateFixtureTarget or type(enabled) is not bool:
+            raise CredentialError("PRIVATE_TARGET_INVALID")
+        if vault is not None and type(vault) is not SyntheticVault:
+            raise CredentialError("SYNTHETIC_ONLY")
+        self.target,self.vault,self.enabled=target,vault,enabled
+
+    def acquire(self,expected):
+        if not self.enabled:raise CredentialError("PROVIDER_DISABLED")
+        if type(expected) is not PrivateFixtureTarget or expected!=self.target:
+            raise CredentialError("PRIVATE_TARGET_MISMATCH")
+        if self.vault is None or self.vault.closed:raise CredentialError("PRIVATE_CREDENTIAL_ABSENT")
+        return self.vault
+
+    def close(self):
+        if self.vault is not None:self.vault.close()
+        self.enabled=False
+
+
 class CredentialFixtureJob(fenced.FencedFixtureJob):
-    """Worker C1/C2 inchangé côté réseau ; un seul handle secret est hérité."""
+    """F2 : aucun handle héritable ; duplication vers le worker suspendu seul."""
 
     def __init__(self, fixture, budget, fence, authorization, vault, *, action="read"):
         if type(authorization) is not trial.FixtureTrial or type(vault) is not SyntheticVault or vault.closed:
@@ -104,7 +140,8 @@ class CredentialFixtureJob(fenced.FencedFixtureJob):
         self.read_pipe,self.write_pipe=w.HANDLE(),w.HANDLE()
         signatures={
             "CreatePipe":([ctypes.POINTER(w.HANDLE),ctypes.POINTER(w.HANDLE),ctypes.c_void_p,w.DWORD],w.BOOL),
-            "SetHandleInformation":([w.HANDLE,w.DWORD,w.DWORD],w.BOOL),
+            "GetCurrentProcess":([],w.HANDLE),
+            "DuplicateHandle":([w.HANDLE,w.HANDLE,w.HANDLE,ctypes.POINTER(w.HANDLE),w.DWORD,w.BOOL,w.DWORD],w.BOOL),
             "WriteFile":([w.HANDLE,ctypes.c_void_p,w.DWORD,ctypes.POINTER(w.DWORD),ctypes.c_void_p],w.BOOL),
         }
         for name,(args,result) in signatures.items():
@@ -119,29 +156,38 @@ class CredentialFixtureJob(fenced.FencedFixtureJob):
             self.budget=min(self.budget,remaining)
             if not self.api.CreatePipe(ctypes.byref(self.read_pipe),ctypes.byref(self.write_pipe),None,4096):
                 raise CredentialError("PIPE_CREATE_REFUSED")
-            if not self.api.SetHandleInformation(self.read_pipe,1,1):
-                raise CredentialError("PIPE_INHERIT_REFUSED")
             return super().start()
         except BaseException:
             self.stop()
             self.authorization.suspend()
             raise
 
-    def _creation_attributes(self):
-        return super()._creation_attributes()+[(0x20002,(w.HANDLE*1)(self.read_pipe.value))]
-
     def _inherit_handles(self):
-        return True  # HANDLE_LIST contient uniquement l'extrémité de lecture.
+        return False
+
+    def _process_executable(self):
+        # Le launcher venv ferait un second processus sans transmettre le handle
+        # non héritable. Ce worker n'utilise que la stdlib de ce même Python.
+        return sys._base_executable
 
     def _creation_command(self, command):
-        return ctypes.create_unicode_buffer(subprocess.list2cmdline([sys.executable,"-I",
-            str(Path(__file__).with_name("private_local_worker.py")),"--fixture-secret",
-            str(self.read_pipe.value),str(self.root)]))
+        return ctypes.create_unicode_buffer(subprocess.list2cmdline([self._process_executable(),"-I",
+            str(Path(__file__).with_name("private_local_worker.py")),"--fixture-secret-duplicated",str(self.root)]))
 
     def _launch(self, command, environment):
         try:
             self.deadline=min(self.deadline,self.authorization.native_deadline)
             super()._launch(command,environment)
+            remote=w.HANDLE()
+            if not self.api.DuplicateHandle(self.api.GetCurrentProcess(),self.read_pipe,self.process.process,
+                    ctypes.byref(remote),0,False,2):
+                raise CredentialError("PIPE_DUPLICATE_REFUSED")
+            self.api.CloseHandle(self.read_pipe)
+            self.read_pipe=w.HANDLE()
+            path=self.root/"request.json"
+            config=fenced.read_request(path)
+            config["secret_handle"]=remote.value  # Numéro uniquement, aucun secret.
+            path.write_text(json.dumps(config,ensure_ascii=False),encoding="utf-8")
             def transfer(plaintext):
                 frame=bytearray(len(plaintext).to_bytes(4,"little"))+plaintext
                 try:

@@ -90,7 +90,7 @@ def certificate_fixture(directory):
 class LoopbackLab:
     """Pas de hostname/URL configurable, ni socket sortante dans le serveur."""
 
-    def __init__(self, directory, *, mode="complete", tls=False, delay=0, body=None):
+    def __init__(self, directory, *, mode="complete", tls=False, delay=0, body=None, http_status=200, advertised_size=None):
         if mode not in {"complete", "tls_block", "write_block", "headers_block", "late", "truncated", "reset", "redirect", "malformed", "error"}:
             raise LabError("MODE_INVALID")
         if type(tls) is not bool or type(delay) not in (int,float) or not 0 <= delay <= 5:
@@ -98,6 +98,10 @@ class LoopbackLab:
         self.root = Path(directory).absolute()
         self.mode, self.tls, self.delay = mode, tls, delay
         self.body = body if body is not None else b'{"ok":true,"result":[]}'
+        if (type(http_status) is not int or http_status not in {200,400,401,403,409,429,500}
+                or (advertised_size is not None and (type(advertised_size) is not int or not 0<=advertised_size<=65537))):
+            raise LabError("RESPONSE_INVALID")
+        self.http_status,self.advertised_size=http_status,advertised_size
         if not isinstance(self.body, bytes) or len(self.body)>65536:
             raise LabError("BODY_INVALID")
         self.closed = threading.Event()
@@ -185,7 +189,7 @@ class LoopbackLab:
                     return
                 if self.closed.wait(self.delay):return
                 data=self.body
-                status=b"HTTP/1.1 200 OK"
+                status=b"HTTP/1.1 "+str(self.http_status).encode()+b" Fixture"
                 if self.mode=="error":
                     status=b"HTTP/1.1 429 Too Many Requests"
                     data=b'{"ok":false,"error_code":429,"parameters":{"retry_after":2}}'
@@ -195,6 +199,7 @@ class LoopbackLab:
                     connection.sendall(b"HTTP/1.1 302 Found\r\nLocation: https://invalid.example/\r\nContent-Length: 0\r\n\r\n")
                     return
                 advertised=len(data)+(5 if self.mode=="truncated" else 0)
+                if self.advertised_size is not None:advertised=self.advertised_size
                 self.reply_attempted.set()
                 connection.sendall(status+b"\r\nContent-Length: "+str(advertised).encode()+b"\r\n\r\n"+data)
         except (OSError,ValueError,LabError):
