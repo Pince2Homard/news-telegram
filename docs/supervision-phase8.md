@@ -71,5 +71,5 @@ Référence officielle pour les objets et contrôles futurs :
 [Telegram Bot API](https://core.telegram.org/bots/api).
 
 Aucun jeton, appel Telegram, modification de production, tâche Windows ou fusion
-n'est nécessaire à cette préparation. La PR #10 validée reste intacte ; le
-travail est isolé sur `codex/supervision-private-channel`, sans publication GitHub.
+n'est nécessaire à cette préparation. La PR #10 fusionnée reste intacte ; le
+travail est isolé sur `codex/supervision-private-channel`, dans une PR dédiée.
