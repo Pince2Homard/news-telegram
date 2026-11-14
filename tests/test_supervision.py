@@ -9,6 +9,22 @@ from tools.windows_watcher import supervision
 
 
 class SupervisionTests(unittest.TestCase):
+    def test_codex_channel_configuration_is_simulation_only_and_not_an_identity(self):
+        config = json.loads((Path(__file__).resolve().parents[1] / "tools" /
+            "windows_watcher" / "supervision.example.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["notifications_channel_id"], -1003833675690)
+        self.assertIsNone(config["arbitration_private_chat_id"])
+        self.assertIsNone(config["owner_user_id"])
+        with patch("urllib.request.urlopen", side_effect=AssertionError("no network")):
+            result = supervision.simulate_notification(config, 1)
+            identity = supervision.simulate_private_identity(config, {
+                "chat": {"type": "channel", "id": config["notifications_channel_id"]},
+                "from": {"id": 12345, "is_bot": False}})
+        self.assertFalse(result["sent"])
+        self.assertTrue(result["destination_configured"])
+        self.assertFalse(identity["identity_matches"])
+        self.assertFalse(identity["decision_authorized"])
+
     def setUp(self):
         self.config = json.loads((Path(__file__).resolve().parents[1] / "tools" /
             "windows_watcher" / "supervision.example.json").read_text(encoding="utf-8"))

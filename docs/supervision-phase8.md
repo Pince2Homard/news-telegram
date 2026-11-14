@@ -1,8 +1,10 @@
 # Supervision Telegram — préparation Phase 8.0
 
 Le canal de notifications sera **l'ancien canal de test existant**, passé en
-mode privé par le propriétaire. Aucun canal supplémentaire n'est créé. Son
-identifiant reste inconnu ici : aucune valeur n'est déduite ou demandée.
+mode privé par le propriétaire. Il est nommé **Codex** et son identifiant
+fourni par le propriétaire est **-1003833675690**. Aucun canal supplémentaire
+n'est créé. Cet identifiant est configuré uniquement pour la supervision ; il
+n'a pas été vérifié par un appel Telegram pendant cette phase.
 
 ## Séparation des destinations
 
@@ -13,15 +15,16 @@ phase. Les notifications Windows et l'installation existante restent inchangées
 
 Le contrat optionnel `tools/windows_watcher/supervision.example.json` prévoit :
 
-- `notifications_channel_id` : identifiant numérique vérifié de l'ancien canal
-  de test, distinct de toute destination de production ;
+- `notifications_channel_id` : `-1003833675690`, destination de supervision
+  fournie par le propriétaire, à vérifier avant activation ;
 - `arbitration_private_chat_id` : conversation privée directe avec le bot dédié,
   distincte du canal de notifications et de ses éventuelles discussions ;
 - `owner_user_id` : identité Telegram numérique du propriétaire, vérifiée
   séparément, jamais un nom public ou un titre ;
 - `mode: simulation` et `send_enabled: false` : seuls réglages acceptés ici.
 
-Ces trois identifiants restent `null` dans l'exemple. Le futur fichier réel sera
+Les identifiants privés d'arbitrage et du propriétaire restent `null` dans
+l'exemple ; aucun n'est déduit du canal Codex. Le futur fichier réel sera
 `%LOCALAPPDATA%\NewsTelegramWatcher\supervision.json`, hors du dépôt et non
 versionné ; il ne contiendra pas le token. Aucun paramètre de
 supervision ne reprend par défaut `TELEGRAM_CHAT`, le token ou les secrets de
@@ -33,8 +36,9 @@ production. Aucun accès aux variables de production n'est implémenté.
 réseau, stockage, planification ou fonction d'envoi. Il simule un compteur
 d'événements et la comparaison d'identifiants privés. Il refuse le mode réel,
 les noms publics de canal et les options inconnues. Il n'est pas déployé dans
-l'installation Windows actuelle. Les identifiants utilisés dans les tests sont
-synthétiques et ne sont jamais contactés.
+l'installation Windows actuelle. Les tests d'identité utilisent des identifiants
+synthétiques ; le test de configuration du canal Codex reste aussi entièrement
+hors ligne. Aucun identifiant n'est contacté.
 
 ## Conditions d'une future activation, à autoriser séparément
 
