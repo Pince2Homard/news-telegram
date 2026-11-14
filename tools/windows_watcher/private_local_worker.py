@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import os
+from uuid import UUID
 
 
 def audit(event, args):
@@ -22,16 +23,22 @@ def audit(event, args):
 
 
 PORT = 0
+GENERATION = None
 
 
 def main(root):
-    global PORT
+    global PORT, GENERATION
     config_path = root / "request.json"
     if config_path.is_symlink() or not config_path.is_file() or config_path.stat().st_size > 4096:
         return
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    if set(config) != {"mode", "port", "delay", "tls", "size"}:
+    fields = {"mode", "port", "delay", "tls", "size"}
+    if set(config) not in (fields, fields | {"generation"}):
         return
+    if "generation" in config:
+        if not isinstance(config["generation"], str) or str(UUID(config["generation"])) != config["generation"]:
+            return
+        GENERATION = config["generation"]
     mode = config["mode"]
     if (mode not in {"request", "dns_block", "write_block", "tree", "tree_exit"}
             or type(config["port"]) is not int or not 0 <= config["port"] <= 65535
@@ -105,6 +112,8 @@ def main(root):
                 body += chunk
             result = {"code": "complete", "http_status": 200 if lines[0].startswith(b"HTTP/1.1 200") else 429,
                       "body": body.decode("utf-8"), "peer": "127.0.0.1", "tls": config["tls"]}
+            if GENERATION is not None:
+                result["generation"] = GENERATION
             (root / "result.json").write_text(json.dumps(result), encoding="utf-8")
 
 
@@ -118,4 +127,7 @@ if __name__ == "__main__":
             main(directory)
         except Exception:
             # Aucun texte d'exception, corps, chemin ou environnement dans les logs.
-            (directory / "result.json").write_text(json.dumps({"code": "fixture_error"}), encoding="utf-8")
+            error = {"code": "fixture_error"}
+            if GENERATION is not None:
+                error["generation"] = GENERATION
+            (directory / "result.json").write_text(json.dumps(error), encoding="utf-8")

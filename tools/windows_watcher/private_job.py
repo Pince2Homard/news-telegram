@@ -114,7 +114,7 @@ class WindowsFixtureJob:
         try:
             if (self.root / "result.json").exists() or (self.root / "result.json").is_symlink():
                 raise WorkerError("STALE_RESULT")
-            self.job = self.api.CreateJobObjectW(None, None)
+            self.job = self._new_job()
             if not self.job:
                 raise WorkerError("JOB_CREATE")
             limits = ExtendedLimit()
@@ -128,21 +128,7 @@ class WindowsFixtureJob:
             # Pas d'environnement hérité susceptible de contenir un credential.
             environment = ctypes.create_unicode_buffer("\0".join([
                 "SystemRoot="+os.environ["SystemRoot"], "PYTHONDONTWRITEBYTECODE=1", "PYTHONUTF8=1", ""]) + "\0")
-            startup = Startup()
-            startup.cb = ctypes.sizeof(startup)
-            flags = 0x4 | 0x400 | 0x08000000  # SUSPENDED, UNICODE_ENVIRONMENT, NO_WINDOW
-            if not self.api.CreateProcessW(sys.executable, command, None, None, False, flags,
-                    environment, str(self.root), ctypes.byref(startup), ctypes.byref(self.process)):
-                raise WorkerError("PROCESS_CREATE")
-            self.trace.append("suspended")
-            if not self.api.AssignProcessToJobObject(self.job, self.process.process):
-                # Aucun fallback non supervisé ; le processus est encore suspendu.
-                if not self.api.TerminateProcess(self.process.process, 77):
-                    raise UnsafeStop("UNASSIGNED_PROCESS")
-                if self.api.WaitForSingleObject(self.process.process, 2000) != 0:
-                    raise UnsafeStop("UNASSIGNED_PROCESS")
-                raise WorkerError("JOB_ASSIGN")
-            self.trace.append("assigned")
+            self._launch(command, environment)
             if time.monotonic() >= self.deadline:
                 raise WorkerError("START_EXPIRED")
             if self.api.ResumeThread(self.process.thread) == 0xFFFFFFFF:
@@ -152,6 +138,26 @@ class WindowsFixtureJob:
         except BaseException:
             self.stop()
             raise
+
+    def _new_job(self):
+        return self.api.CreateJobObjectW(None, None)
+
+    def _launch(self, command, environment):
+        startup = Startup()
+        startup.cb = ctypes.sizeof(startup)
+        flags = 0x4 | 0x400 | 0x08000000  # SUSPENDED, UNICODE_ENVIRONMENT, NO_WINDOW
+        if not self.api.CreateProcessW(sys.executable, command, None, None, False, flags,
+                environment, str(self.root), ctypes.byref(startup), ctypes.byref(self.process)):
+            raise WorkerError("PROCESS_CREATE")
+        self.trace.append("suspended")
+        if not self.api.AssignProcessToJobObject(self.job, self.process.process):
+            # Aucun fallback non supervisé ; le processus est encore suspendu.
+            if not self.api.TerminateProcess(self.process.process, 77):
+                raise UnsafeStop("UNASSIGNED_PROCESS")
+            if self.api.WaitForSingleObject(self.process.process, 2000) != 0:
+                raise UnsafeStop("UNASSIGNED_PROCESS")
+            raise WorkerError("JOB_ASSIGN")
+        self.trace.append("assigned")
 
     def accounting(self):
         result = Accounting()
