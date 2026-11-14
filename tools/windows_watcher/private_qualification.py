@@ -402,6 +402,9 @@ def restore_fixture(area, backup, destination, config, bot_id, now, *, generatio
         config = delivery.supervision.validate_config(config)
         _write_json(destination / "fixture-identity.json", {"simulation_only": True, "bot_id": bot_id,
             "owner_id": config["owner_user_id"], "chat_id": config["arbitration_private_chat_id"]})
+        # Ne pas dépendre d'un umask permissif à l'ouverture du verrou a+b.
+        descriptor = os.open(destination / "fixture.lock", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
         with QualifiedStore(destination, config, bot_id, now, area=area, store_id=store_id,
                             generation=generation) as restored:
             return {**restored.status(), "restored_disarmed": True}

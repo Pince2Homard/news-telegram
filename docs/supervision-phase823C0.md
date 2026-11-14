@@ -95,6 +95,8 @@ schéma B2. La migration valide B2 avant le DDL, ajoute cette table et versionne
 user_version dans BEGIN IMMEDIATE. L'identité locale de magasin est un UUID
 injecté, distinct de la génération B2. Une identité ou génération incohérente
 est refusée. Aucun reset ni perte des tables B1/B2.
+Le verrou restauré est précréé en mode 0600 sous POSIX, au lieu de dépendre du
+mode par défaut a+b du watcher ; les permissions strictes restent contrôlées.
 
 La copie destinée à une sauvegarde est elle-même rendue inutilisable pour une
 livraison avant publication du manifeste :
@@ -252,6 +254,9 @@ l'unique aire autorisée, et le test POSIX reste ignoré sous Windows. La seule
 vérification fonctionnelle ajoutée après l'essai natif refuse une annexe SQLite
 inattendue dans une sauvegarde ; le code ACL qualifié est inchangé. Les essais
 d'horloge injectent les dates : aucune modification de l'horloge Windows.
+La première CI Linux a détecté le mode trop ouvert du verrou restauré et d'une
+annexe de test. Leur création privée a été corrigée, sans assouplir le refus des
+permissions dangereuses ; un contrôle explicite des modes restaurés est ajouté.
 
 ```text
 python -m unittest discover -s tests -v

@@ -117,6 +117,9 @@ class QualificationTests(unittest.TestCase):
             self.assertEqual(session.deliver(1, transport, NOW, permission=PERMISSION), "confirmed")
         restored, status = self.restore(backup)
         self.assertTrue(status["restored_disarmed"])
+        if os.name != "nt":
+            for path in restored.iterdir():
+                self.assertEqual(path.stat().st_mode & 0o077,0)
         self.assertIsNone(status["next_offset"])
         self.assertEqual(status["stored_offset"], before["stored_offset"])
         with q.QualifiedStore(restored, CONFIG, BOT, NOW, area=self.area, store_id=RESTORED,
@@ -179,7 +182,8 @@ class QualificationTests(unittest.TestCase):
                               source_id=RESTORED,store_id=SOURCE)
         self.assertFalse(destination.exists())
         annex=backup/"image.sqlite3-wal"
-        annex.write_bytes(b"unexpected fixture annex")
+        with open(annex,"xb",opener=lambda path,flags:os.open(path,flags,0o600)) as output:
+            output.write(b"unexpected fixture annex")
         with self.assertRaisesRegex(base.StoreError,"BACKUP_INVALID"):
             self.restore(backup)
         self.assertFalse(destination.exists())
