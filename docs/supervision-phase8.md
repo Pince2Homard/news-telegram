@@ -1,7 +1,50 @@
 # Supervision Telegram — préparation Phase 8.0
 
 La préparation ponctuelle suivante et ses simulations sont décrites dans
-[Phase 8.1](supervision-phase81.md). Aucun transport réel n'est activé.
+[Phase 8.1](supervision-phase81.md). Le transport reste exclusivement manuel ;
+aucune notification automatique n'est activée.
+
+## Bilan de validation avant intégration — 14 novembre 2026
+
+Les notes 8.0 à 8.1.7 ci-dessous décrivent les étapes successives de préparation.
+Le parcours manuel ponctuel a depuis été validé avec les autorisations du
+propriétaire : identité de @Codex2PinceBot, canal privé Codex et droit
+can_post_messages confirmés par trois réponses API HTTP 200. Un contrôle
+précédent avait signalé ADMIN_PERMISSION ; le propriétaire a ensuite activé
+uniquement la publication. L'ancien premier échec non instrumenté ne peut
+toujours pas être attribué rétrospectivement à une cause certaine.
+
+L'unique message autorisé a été confirmé sous l'identifiant Telegram **1947**.
+Le journal durable reste **confirmed, attempts=1**, avec la référence
+phase81-codex-single-notification-v1 et l'empreinte approuvée. L'autorisation est
+consommée. Aucun nouvel essai réel n'est nécessaire à la finalisation de la PR.
+Le blocage d'une répétition est vérifié hors ligne sur une copie du journal ;
+le fichier réel n'est ni modifié, ni déplacé, ni supprimé.
+
+La configuration send_enabled=false concerne le contrat de supervision ; elle
+ne lance rien. Le parcours manuel séparé --send-real exige sa propre approbation
+exacte et reste bloqué par le journal de cet essai. Il n'existe pas de liaison
+automatique entre les événements du watcher et Telegram. Les commandes réelles
+ne sont pas des commandes d'installation ni des exemples à rejouer.
+
+Compatibilité : le watcher Windows conserve son registre, sa configuration et
+son manifeste d'installation actuels. Les modules Telegram ne sont pas ajoutés
+automatiquement par manage.py install et s'utilisent explicitement depuis le
+dépôt de développement. La fusion ne constitue ni une installation locale ni
+une activation de service ou de tâche.
+
+Risques résiduels : résultat réseau ambigu sans preuve de non-livraison, perte
+du verrou anti-doublons si le propriétaire supprime volontairement le journal,
+timeouts par opération sans budget total, contrôles ACL conservateurs et
+administrateurs locaux considérés de confiance. Les compteurs API ne remplacent
+pas les contrôles d'identité. Aucun arbitrage interactif n'est implémenté.
+
+Retour arrière : arrêter d'utiliser les commandes de supervision ; une éventuelle
+annulation Git doit retirer uniquement les ajouts de supervision. Ne jamais
+restaurer un ancien state.json de production. Conserver le journal confirmé,
+les reçus, la configuration et le credential protégé ; revenir à un ancien code
+n'autorise pas à réutiliser l'approbation d'envoi. L'installation Windows actuelle
+n'étant pas modifiée par cette PR, elle n'a pas à être restaurée pour l'annuler.
 
 Le canal de notifications sera **l'ancien canal de test existant**, passé en
 mode privé par le propriétaire. Il est nommé **Codex** et son identifiant
