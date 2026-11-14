@@ -1,5 +1,8 @@
 # Supervision Telegram — préparation Phase 8.0
 
+La préparation ponctuelle suivante et ses simulations sont décrites dans
+[Phase 8.1](supervision-phase81.md). Aucun transport réel n'est activé.
+
 Le canal de notifications sera **l'ancien canal de test existant**, passé en
 mode privé par le propriétaire. Il est nommé **Codex** et son identifiant
 fourni par le propriétaire est **-1003833675690**. Aucun canal supplémentaire
