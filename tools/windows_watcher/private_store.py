@@ -169,6 +169,7 @@ class SimulationStore:
             self._validate()
             self._quota()
             self.resume(self.now)
+            self._on_open()
             return self
         except BaseException as error:
             self.__exit__(None, None, None)
@@ -190,6 +191,9 @@ class SimulationStore:
     def _active(self):
         if self.connection is None or self.failed:
             raise StoreError("SESSION_CLOSED")
+
+    def _on_open(self):
+        """Point d'extension de reprise, sans effet pour le schéma B1."""
 
     @contextmanager
     def _transaction(self):
@@ -236,12 +240,12 @@ class SimulationStore:
     def _save_meta(self, meta):
         self.connection.execute("UPDATE meta SET data=? WHERE id=1", (json.dumps(meta),))
 
-    def _validate(self):
-        if self.connection.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+    def _validate(self, *, schema=SCHEMA, version=SCHEMA_VERSION):
+        if self.connection.execute("PRAGMA user_version").fetchone()[0] != version:
             raise StoreError("SCHEMA_INVALID")
         actual = dict(self.connection.execute(
             "SELECT name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))
-        if actual != SCHEMA or self.connection.execute("PRAGMA integrity_check").fetchall()[0][0] != "ok":
+        if actual != schema or self.connection.execute("PRAGMA integrity_check").fetchall()[0][0] != "ok":
             raise StoreError("SCHEMA_INVALID")
         if self.connection.execute("PRAGMA foreign_key_check").fetchone():
             raise StoreError("INTEGRITY_INVALID")
