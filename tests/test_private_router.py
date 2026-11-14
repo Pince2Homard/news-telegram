@@ -25,8 +25,8 @@ class PrivateRouterTests(unittest.TestCase):
         return router.route_message({**self.message, "text": text}, self.config,
                                     self.snapshot if snapshot is None else snapshot, self.now)
 
-    def test_three_commands_only_and_structured_simulation(self):
-        for command in ("/start", "/help", "/status"):
+    def test_six_commands_and_structured_simulation(self):
+        for command in ("/start", "/help", "/status", "/pr", "/ci", "/rapports"):
             with self.subTest(command=command):
                 result = self.route(command)
                 self.assertTrue(result["authorized"])
@@ -37,7 +37,7 @@ class PrivateRouterTests(unittest.TestCase):
                 self.assertLessEqual(len(result["text"]), router.MAX_RESPONSE_LENGTH)
         help_text = self.route("/help")["text"]
         self.assertEqual({word for word in help_text.split() if word.startswith("/")},
-                         {"/start", "/help", "/status"})
+                         {"/start", "/help", "/status", "/pr", "/ci", "/rapports"})
         self.assertIn("QG mobile Codex", self.route("/start")["text"])
 
     def test_identity_rejections_are_silent_and_indistinguishable(self):
@@ -60,7 +60,7 @@ class PrivateRouterTests(unittest.TestCase):
                      {**self.message, "chat": {"username": "owner", "type": "private"}}]
         expected = router.route_message(None, None, None, None)
         for message in messages:
-            for command in ("/start", "/help", "/status"):
+            for command in ("/start", "/help", "/status", "/pr", "/ci", "/rapports"):
                 candidate = {**message, "text": command} if isinstance(message, dict) else message
                 with self.subTest(message=candidate):
                     self.assertEqual(router.route_message(candidate, self.config,
@@ -165,7 +165,7 @@ class PrivateRouterTests(unittest.TestCase):
                            "requests.sessions.Session.request", "subprocess.Popen", "os.getenv",
                            "os._Environ.__getitem__", "time.time"):
                 stack.enter_context(patch(target, side_effect=AssertionError("I/O interdit")))
-            for command in ("/start", "/help", "/status", "/exec", None):
+            for command in ("/start", "/help", "/status", "/pr", "/ci", "/rapports", "/exec", None):
                 self.route(command)
             router.route_message(None, None, None, None)
         self.assertEqual((self.message, self.config, self.snapshot), before)
@@ -177,7 +177,7 @@ class PrivateRouterTests(unittest.TestCase):
         imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
         imports.update(alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
                        for alias in node.names)
-        self.assertEqual(imports, {"datetime", "html", "math", None})
+        self.assertEqual(imports, {"datetime", "html", "json", "math", "re", None})
         for name in ("watcher.py", "manage.py", "telegram_http.py", "telegram_once.py"):
             self.assertNotIn("private_router", Path(router.__file__).with_name(name).read_text(encoding="utf-8"))
 
