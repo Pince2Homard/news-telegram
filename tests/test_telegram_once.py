@@ -106,6 +106,13 @@ class TelegramOnceTests(unittest.TestCase):
         with self.assertRaises(once.Refused): self.send()
         self.assertEqual(self.calls, [])
 
+    def test_new_journal_acl_must_pass_before_post(self):
+        with self.assertRaises(ValueError):
+            once.send_once(self.transport, self.root, once.approval_digest(),
+                           journal_guard=MockGuard())
+        self.assertNotIn('sendMessage', [m for m, _ in self.calls])
+        self.assertEqual(self.send()['status'], 'in_flight')
+
     def test_token_file_in_repository_rejected_no_production_fallback(self):
         token = self.root / "credential"
         token.write_text("fixture-not-a-real-token", encoding="utf-8")
@@ -113,7 +120,8 @@ class TelegramOnceTests(unittest.TestCase):
             with self.assertRaises(once.Refused): once.read_external_token(token, self.root)
         token.chmod(0o600)
         if os.name == "nt":
-            with self.assertRaises(once.Refused): once.read_external_token(token, self.root / "repo")
+            with patch('tools.windows_watcher.credential_acl.verify', side_effect=ValueError('unsafe')):
+                with self.assertRaises(once.Refused): once.read_external_token(token, self.root / "repo")
         else:
             self.assertEqual(once.read_external_token(token, self.root / "repo"), "fixture-not-a-real-token")
 
@@ -125,3 +133,8 @@ class TelegramOnceTests(unittest.TestCase):
         self.assertTrue(result["second_call_blocked"])
         self.assertEqual(result["status"], "confirmed")
         self.assertEqual(json.loads(json.dumps(result)), result)
+
+
+class MockGuard:
+    def __call__(self, path):
+        raise ValueError('unsafe inherited permissions')

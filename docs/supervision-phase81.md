@@ -1,5 +1,9 @@
 # Phase 8.1 — connexion ponctuelle préparée, non activée
 
+Les blocages HTTP et ACL décrits ci-dessous correspondent à cette étape
+historique ; leur implémentation et les procédures toujours soumises à
+autorisation sont documentées en [Phase 8.1.1](supervision-phase811.md).
+
 Aucun travail Phase 8.1 antérieur n'a été trouvé lors de la reprise de la
 branche. La Phase 8.0, son exemple et ses verrous restent inchangés.
 

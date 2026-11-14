@@ -1,4 +1,4 @@
-"""Essai ponctuel prepare ; CLI hors ligne uniquement, aucun client HTTP reel."""
+"""Essai ponctuel ; modes reels explicites, jamais appeles automatiquement."""
 import argparse
 import hashlib
 import json
@@ -40,14 +40,23 @@ def read_external_token(path, repository_root):
             raise ValueError()
         if os.name != "nt" and resolved.stat().st_mode & 0o077:
             raise ValueError()
-        # Sous Windows, verification des ACL requise avant toute utilisation reelle.
         if os.name == "nt":
-            raise ValueError()
+            if __package__:
+                from . import credential_acl
+            else:
+                import credential_acl
+            credential_acl.verify(path)
+        before = resolved.stat()
         value = resolved.read_text(encoding="utf-8").strip()
+        after = resolved.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise ValueError()
+        if os.name == "nt":
+            credential_acl.verify(path)
         if not value or any(char.isspace() for char in value):
             raise ValueError()
         return value
-    except (OSError, ValueError, UnicodeError):
+    except Exception:
         raise Refused("Fichier de credential refuse ; aucun contenu affiche.") from None
 
 
@@ -81,7 +90,7 @@ def verify(transport):
         raise Refused("Droit de publication du bot non confirme.")
 
 
-def send_once(transport, directory, approval):
+def send_once(transport, directory, approval, journal_guard=None):
     """Transport injecte ; aucun appel depuis watcher, tableau ou decision recue."""
     if approval != approval_digest():
         raise Refused("Approbation exacte du message necessaire.")
@@ -101,6 +110,9 @@ def send_once(transport, directory, approval):
         verify(transport)
         saved = {"trial": TRIAL, "approval_digest": approval, "status": "in_flight", "attempts": 1}
         watcher.save_state(journal, saved)  # Durable AVANT l'unique tentative.
+        if journal_guard is not None:
+            journal_guard(journal)
+            journal_guard(directory / 'telegram-once.lock')
         try:
             response = transport("sendMessage", {"chat_id": CHANNEL, "text": MESSAGE})
             if isinstance(response, dict) and response.get("ok") is False:
@@ -146,10 +158,50 @@ def simulate():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--simulate", action="store_true", required=True)
-    parser.parse_args()
-    print(json.dumps({"message": MESSAGE, "approval_digest": approval_digest(), **simulate()}, ensure_ascii=True))
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--simulate", action="store_true")
+    modes.add_argument("--verify-real", action="store_true")
+    modes.add_argument("--send-real", action="store_true")
+    parser.add_argument("--approve-digest")
+    args = parser.parse_args()
+    try:
+        if args.simulate:
+            print(json.dumps({"message": MESSAGE, "approval_digest": approval_digest(), **simulate()}, ensure_ascii=True))
+            return 0
+        if args.send_real and args.approve_digest != approval_digest():
+            raise Refused('Approbation exacte requise avant lecture du credential')
+        if __package__:
+            from .telegram_http import TelegramHTTP
+        else:
+            from telegram_http import TelegramHTTP
+        root = Path(os.environ['LOCALAPPDATA']) / 'NewsTelegramWatcher'
+        directory = root / 'telegram-once'
+        repository = Path(__file__).resolve().parents[2]
+        if root.resolve().is_relative_to(repository):
+            raise Refused('Emplacement durable refuse')
+        token = read_external_token(root / 'credentials' / 'supervision-token.txt', repository)
+        transport = TelegramHTTP(token, allow_send=args.send_real)
+        if args.verify_real:
+            verify(transport)
+            print('Identite du bot, canal prive et permissions confirmes ; aucun message envoye.')
+        else:
+            directory.mkdir(parents=True, exist_ok=True)
+            if os.name == 'nt':
+                if __package__:
+                    from . import credential_acl
+                else:
+                    import credential_acl
+                credential_acl.verify(directory)
+                for name in ('telegram-once.json', 'telegram-once.lock'):
+                    if (directory / name).exists():
+                        credential_acl.verify(directory / name)
+            guard = credential_acl.verify if os.name == 'nt' else None
+            print(json.dumps(send_once(transport, directory, args.approve_digest, journal_guard=guard), ensure_ascii=True))
+        return 0
+    except Exception:
+        print('Operation refusee ou non confirmee ; aucun retry automatique.')
+        return 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
