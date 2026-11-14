@@ -77,22 +77,24 @@ class FencedFixtureJob(jobs.WindowsFixtureJob):
             raise recovery.FenceError("REQUEST_ALREADY_BOUND")
         config["generation"]=self.session
         path.write_text(json.dumps(config),encoding="utf-8")
+        attributes=self._creation_attributes()
         size=ctypes.c_size_t()
-        self.api.InitializeProcThreadAttributeList(None,1,0,ctypes.byref(size))
+        self.api.InitializeProcThreadAttributeList(None,len(attributes),0,ctypes.byref(size))
         if not 0<size.value<65536:raise jobs.WorkerError("JOB_ATTRIBUTE_SIZE")
         buffer=ctypes.create_string_buffer(size.value)
         startup=StartupEx()
         startup.startup.cb=ctypes.sizeof(startup)
         startup.attributes=ctypes.cast(buffer,ctypes.c_void_p)
-        if not self.api.InitializeProcThreadAttributeList(startup.attributes,1,0,ctypes.byref(size)):
+        if not self.api.InitializeProcThreadAttributeList(startup.attributes,len(attributes),0,ctypes.byref(size)):
             raise jobs.WorkerError("JOB_ATTRIBUTE_INIT")
-        handles=(w.HANDLE*1)(self.job)
         try:
-            if not self.api.UpdateProcThreadAttribute(startup.attributes,0,0x2000D,
-                    ctypes.byref(handles),ctypes.sizeof(handles),None,None):
-                raise jobs.WorkerError("JOB_ATTRIBUTE_REFUSED")
+            for key,value in attributes:
+                if not self.api.UpdateProcThreadAttribute(startup.attributes,0,key,
+                        ctypes.byref(value),ctypes.sizeof(value),None,None):
+                    raise jobs.WorkerError("JOB_ATTRIBUTE_REFUSED")
             flags=0x4|0x400|0x08000000|0x80000  # Extended startup + suspended.
-            if not self.api.CreateProcessW(sys.executable,command,None,None,False,flags,environment,str(self.root),
+            if not self.api.CreateProcessW(sys.executable,self._creation_command(command),None,None,
+                    self._inherit_handles(),flags,environment,str(self.root),
                     ctypes.cast(ctypes.byref(startup),ctypes.POINTER(jobs.Startup)),ctypes.byref(self.process)):
                 raise jobs.WorkerError("ATOMIC_PROCESS_CREATE")
         finally:self.api.DeleteProcThreadAttributeList(startup.attributes)
@@ -101,6 +103,15 @@ class FencedFixtureJob(jobs.WindowsFixtureJob):
             raise jobs.UnsafeStop("ATOMIC_ASSIGN_UNPROVEN")
         self.trace.extend(["suspended","assigned"])
         self.fault("after_process")  # Toujours suspendu ET déjà dans le job.
+
+    def _creation_attributes(self):
+        return [(0x2000D,(w.HANDLE*1)(self.job))]
+
+    def _creation_command(self, command):
+        return command
+
+    def _inherit_handles(self):
+        return False
 
     def stop(self):
         if self.safe:return self.final_counts
