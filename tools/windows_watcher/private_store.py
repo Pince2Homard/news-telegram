@@ -117,6 +117,7 @@ class SimulationStore:
             if self.create:
                 # Un dossier préexistant, même vide, ne devient pas un nouveau magasin.
                 self.root.mkdir(mode=0o700, parents=False, exist_ok=False)
+                self._on_directory_created()
                 # ACL héritée du dossier sous Windows ; modes privés sous POSIX.
                 for path in (self.path, self.root / "fixture.lock"):
                     descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -194,6 +195,9 @@ class SimulationStore:
 
     def _on_open(self):
         """Point d'extension de reprise, sans effet pour le schéma B1."""
+
+    def _on_directory_created(self):
+        """Point de préparation avant tout fichier, sans effet pour les fixtures B1."""
 
     @contextmanager
     def _transaction(self):
