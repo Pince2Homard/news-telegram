@@ -189,7 +189,8 @@ class DeliveryStore(base.SimulationStore):
                     raise base.StoreError("ATTEMPT_INVALID")
 
     def _on_open(self):
-        # Le verrou garantit qu'aucune tentative d'un autre processus local ne vit.
+        # Le verrou sérialise SQLite, sans prouver la mort d'un worker réseau.
+        # C2 exige sa barrière de génération AVANT cette ouverture de fixture.
         with self._transaction():
             self.connection.execute("UPDATE attempts SET status='uncertain',completed_at=MAX(?,started_at),code='restart' WHERE status='in_flight'", (self.now,))
             self.connection.execute("UPDATE outbox SET status='uncertain' WHERE status='in_flight'")
