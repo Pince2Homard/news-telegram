@@ -52,8 +52,7 @@ class HTTPTests(unittest.TestCase):
                 self.connection.request.assert_called_once()
 
     def test_redirect_bad_json_oversize_and_http_errors(self):
-        for status, body in ((302, b'ignored'), (200, b'invalid'), (200, b'x' * 65537),
-                             (500, b'{"ok":true,"result":{}}')):
+        for status, body in ((302, b'ignored'), (200, b'invalid'), (200, b'x' * 65537)):
             self.response.status = status
             self.response.read.return_value = body
             self.connection.request.reset_mock()

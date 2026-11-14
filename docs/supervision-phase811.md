@@ -1,5 +1,8 @@
 # Phase 8.1.1 — HTTP et ACL Windows, sans activation
 
+La [Phase 8.1.7](supervision-phase817.md) précise les codes et compteurs de
+diagnostic ajoutés après l'échec de la première vérification réelle.
+
 Correction ciblée Phase 8.1.4 : le SID exact
 `S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464`
 (TrustedInstaller) est accepté comme propriétaire uniquement au dernier élément

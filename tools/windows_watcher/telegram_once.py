@@ -7,9 +7,10 @@ from pathlib import Path
 import tempfile
 
 if __package__:
-    from . import watcher
+    from . import watcher, telegram_diagnostics as diagnostic
 else:
     import watcher
+    import telegram_diagnostics as diagnostic
 
 CHANNEL = -1003833675690
 BOT = "Codex2PinceBot"
@@ -20,7 +21,7 @@ MESSAGE = ("[TEST SUPERVISION CODEX — notification unique]\n"
            "Référence : phase81-codex-single-notification-v1")
 
 
-class Refused(Exception):
+class Refused(diagnostic.DiagnosticError):
     """Erreur technique volontairement sans contenu de reponse ou secret."""
 
 
@@ -31,9 +32,12 @@ def approval_digest():
 
 def read_external_token(path, repository_root):
     """Point futur, jamais appele par la CLI ; aucun repli sur la production."""
+    stage = 'CREDENTIAL_PATH'
     try:
         path = Path(path)
+        stage = 'CREDENTIAL_READ'
         resolved = path.resolve(strict=True)
+        stage = 'CREDENTIAL_PATH'
         if path.is_symlink() or resolved.is_relative_to(Path(repository_root).resolve()):
             raise ValueError()
         if not resolved.is_file() or resolved.stat().st_size > 256:
@@ -41,53 +45,62 @@ def read_external_token(path, repository_root):
         if os.name != "nt" and resolved.stat().st_mode & 0o077:
             raise ValueError()
         if os.name == "nt":
+            stage = 'CREDENTIAL_ACL'
             if __package__:
                 from . import credential_acl
             else:
                 import credential_acl
             credential_acl.verify(path)
+        stage = 'CREDENTIAL_READ'
         before = resolved.stat()
         value = resolved.read_text(encoding="utf-8").strip()
         after = resolved.stat()
+        stage = 'CREDENTIAL_CHANGED'
         if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
             raise ValueError()
         if os.name == "nt":
+            stage = 'CREDENTIAL_ACL'
             credential_acl.verify(path)
+        stage = 'CREDENTIAL_FORMAT'
         if not value or any(char.isspace() for char in value):
             raise ValueError()
         return value
     except Exception:
-        raise Refused("Fichier de credential refuse ; aucun contenu affiche.") from None
+        raise Refused(stage) from None
 
 
 def result_of(transport, method, payload):
     try:
         response = transport(method, payload)
+        if isinstance(response, dict) and response.get('ok') is False:
+            raise Refused(diagnostic.http_code(response.get('error_code')))
         if not isinstance(response, dict) or response.get("ok") is not True:
             raise ValueError()
         result = response["result"]
         if not isinstance(result, dict):
             raise ValueError()
         return result
+    except diagnostic.DiagnosticError:
+        raise
     except Exception:
-        raise Refused("Verification Telegram non confirmee ; aucun envoi.") from None
+        raise Refused('API_INVALID') from None
 
 
 def verify(transport):
     me = result_of(transport, "getMe", {})
     bot_id = me.get("id")
     if type(bot_id) is not int or bot_id <= 0 or me.get("is_bot") is not True or me.get("username") != BOT:
-        raise Refused("Identite du bot non concordante.")
+        raise Refused('BOT_IDENTITY')
     chat = result_of(transport, "getChat", {"chat_id": CHANNEL})
     if (type(chat.get("id")) is not int or chat["id"] != CHANNEL or chat.get("type") != "channel"
             or chat.get("title") != "Codex" or chat.get("username") or chat.get("active_usernames")):
-        raise Refused("Canal prive attendu non concordant.")
+        raise Refused('CHANNEL_IDENTITY')
     member = result_of(transport, "getChatMember", {"chat_id": CHANNEL, "user_id": bot_id})
     user = member.get("user")
     if (not isinstance(user, dict) or type(user.get("id")) is not int or user["id"] != bot_id
             or user.get("is_bot") is not True or member.get("status") != "administrator"
             or member.get("can_post_messages") is not True):
-        raise Refused("Droit de publication du bot non confirme.")
+        raise Refused('ADMIN_PERMISSION')
 
 
 def send_once(transport, directory, approval, journal_guard=None):
@@ -164,6 +177,8 @@ def main():
     modes.add_argument("--send-real", action="store_true")
     parser.add_argument("--approve-digest")
     args = parser.parse_args()
+    transport = None
+    stage = 'setup'
     try:
         if args.simulate:
             print(json.dumps({"message": MESSAGE, "approval_digest": approval_digest(), **simulate()}, ensure_ascii=True))
@@ -179,11 +194,13 @@ def main():
         repository = Path(__file__).resolve().parents[2]
         if root.resolve().is_relative_to(repository):
             raise Refused('Emplacement durable refuse')
+        stage = 'credential'
         token = read_external_token(root / 'credentials' / 'supervision-token.txt', repository)
         transport = TelegramHTTP(token, allow_send=args.send_real)
+        stage = 'verification'
         if args.verify_real:
             verify(transport)
-            print('Identite du bot, canal prive et permissions confirmes ; aucun message envoye.')
+            print(json.dumps({'status': 'verified', 'diagnostics': transport.report()}, ensure_ascii=True))
         else:
             directory.mkdir(parents=True, exist_ok=True)
             if os.name == 'nt':
@@ -198,8 +215,12 @@ def main():
             guard = credential_acl.verify if os.name == 'nt' else None
             print(json.dumps(send_once(transport, directory, args.approve_digest, journal_guard=guard), ensure_ascii=True))
         return 0
-    except Exception:
-        print('Operation refusee ou non confirmee ; aucun retry automatique.')
+    except Exception as error:
+        code = diagnostic.error_code(error)
+        print(json.dumps({'status': 'stopped', 'stage': stage, 'error_code': code,
+            'message': diagnostic.MESSAGES[code], 'retry': False,
+            'diagnostics': transport.report() if transport is not None else {
+                'prepared': 0, 'attempted': 0, 'confirmed': 0, 'http_responses': 0, 'steps': []}}, ensure_ascii=True))
         return 2
 
 
