@@ -331,10 +331,9 @@ with FixtureTrial(root/'trial',e,FixturePlan(fixture_enabled=True)) as ledger,Fi
                 def inspect(*args):
                     self.assertNotIn(marker.decode(),args[1].value)
                     self.assertNotIn(marker.decode(),"".join(args[6]))
-                    self.assertTrue(args[4])
+                    self.assertFalse(args[4])
                     attributes=job._creation_attributes()
-                    self.assertEqual([key for key,_ in attributes],[0x2000D,0x20002])
-                    self.assertEqual(list(attributes[1][1]),[job.read_pipe.value])
+                    self.assertEqual([key for key,_ in attributes],[0x2000D])
                     return original(*args)
                 job.api.CreateProcessW=inspect
                 result=job.start().wait()

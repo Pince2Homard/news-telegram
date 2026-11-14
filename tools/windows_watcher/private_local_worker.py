@@ -30,6 +30,21 @@ GENERATION = None
 CREDENTIAL_CONSUMED = False
 
 
+def read_request(path):
+    if path.is_symlink() or not path.is_file() or path.stat().st_size>16384:
+        raise RuntimeError("REQUEST_INVALID")
+    def unique(pairs):
+        result={}
+        for key,value in pairs:
+            if key in result:raise ValueError("REQUEST_INVALID")
+            result[key]=value
+        return result
+    value=json.loads(path.read_text(encoding="utf-8"),object_pairs_hook=unique,
+        parse_constant=lambda _: (_ for _ in ()).throw(ValueError("REQUEST_INVALID")))
+    if type(value) is not dict:raise RuntimeError("REQUEST_INVALID")
+    return value
+
+
 def consume_fixture_pipe(raw_handle):
     """Lecture bornée, format factice fermé, aucun fichier ni credential système."""
     global CREDENTIAL_CONSUMED
@@ -70,12 +85,25 @@ def consume_fixture_pipe(raw_handle):
 def main(root):
     global PORT, GENERATION
     config_path = root / "request.json"
-    if config_path.is_symlink() or not config_path.is_file() or config_path.stat().st_size > 4096:
+    if config_path.is_symlink() or not config_path.is_file() or config_path.stat().st_size > 16384:
         return
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config = read_request(config_path)
     fields = {"mode", "port", "delay", "tls", "size"}
+    if "secret_handle" in config and not CREDENTIAL_CONSUMED:return
+    config.pop("secret_handle",None)  # Métadonnée non secrète consommée avant main.
+    api_request=config.pop("api_request",None)
+    io_timeout=config.pop("io_timeout",15)
+    if type(io_timeout) not in (int,float) or not 0<io_timeout<=15:return
     if set(config) not in (fields, fields | {"generation"}):
         return
+    wire=None
+    if api_request is not None:
+        if (not isinstance(api_request,dict) or set(api_request)!={"method","payload"}
+                or api_request["method"] not in {"getMe","getWebhookInfo","getUpdates","sendMessage"}
+                or not isinstance(api_request["payload"],dict)):
+            return
+        wire=json.dumps(api_request["payload"],ensure_ascii=False,separators=(",",":")).encode("utf-8")
+        if len(wire)>8192:return
     if "generation" in config:
         if not isinstance(config["generation"], str) or str(UUID(config["generation"])) != config["generation"]:
             return
@@ -107,7 +135,7 @@ def main(root):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as raw:
         if mode=="write_block":
             raw.setsockopt(socket.SOL_SOCKET,socket.SO_SNDBUF,0)
-        raw.settimeout(15)
+        raw.settimeout(io_timeout)
         raw.connect(("127.0.0.1", PORT))
         phase("tls" if config["tls"] else "connected")
         if config["tls"]:
@@ -124,8 +152,9 @@ def main(root):
             stream = raw
         with stream:
             phase("write")
-            payload = b"x" * config["size"]
-            stream.sendall(b"POST /fixture HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: "
+            payload = b"x" * config["size"] if wire is None else wire
+            route=b"/fixture" if wire is None else b"/fixture/"+api_request["method"].encode("ascii")
+            stream.sendall(b"POST "+route+b" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "
                            +str(len(payload)).encode()+b"\r\n\r\n"+payload)
             phase("read")
             response = bytearray()
@@ -138,11 +167,18 @@ def main(root):
             if not separator or len(header) > 8192:
                 raise RuntimeError("HEADERS_INVALID")
             lines = header.split(b"\r\n")
-            if lines[0] not in (b"HTTP/1.1 200 OK", b"HTTP/1.1 429 Too Many Requests"):
+            parts=lines[0].split(b" ",2)
+            if len(parts)!=3 or parts[0]!=b"HTTP/1.1" or parts[1] not in {b"200",b"400",b"401",b"403",b"409",b"429",b"500"}:
                 raise RuntimeError("HTTP_REFUSED")
-            if any(line.lower().startswith(b"transfer-encoding:") for line in lines[1:]):
-                raise RuntimeError("FRAMING_INVALID")
-            lengths = [line[16:].strip() for line in lines[1:] if line.lower().startswith(b"content-length: ")]
+            headers={}
+            for line in lines[1:]:
+                key,colon,value=line.partition(b":")
+                key=key.lower()
+                if not colon or re.fullmatch(rb"[!#$%&'*+.^_`|~0-9a-z-]+",key) is None or key in headers:
+                    raise RuntimeError("FRAMING_INVALID")
+                headers[key]=value.strip()
+            if b"transfer-encoding" in headers:raise RuntimeError("FRAMING_INVALID")
+            lengths = [headers[b"content-length"]] if b"content-length" in headers else []
             if len(lengths) != 1 or not lengths[0].isdigit() or not 0 < int(lengths[0]) <= 65536:
                 raise RuntimeError("LENGTH_INVALID")
             length = int(lengths[0])
@@ -151,7 +187,7 @@ def main(root):
                 if not chunk:
                     raise RuntimeError("TRUNCATED")
                 body += chunk
-            result = {"code": "complete", "http_status": 200 if lines[0].startswith(b"HTTP/1.1 200") else 429,
+            result = {"code": "complete", "http_status": int(parts[1]),
                       "body": body.decode("utf-8"), "peer": "127.0.0.1", "tls": config["tls"]}
             if GENERATION is not None:
                 result["generation"] = GENERATION
@@ -164,10 +200,17 @@ if __name__ == "__main__":
     if len(sys.argv)==3 and sys.argv[1]=="--descendant":
         (Path(sys.argv[2])/"descendant.json").write_text(json.dumps({"pid":os.getpid()}),encoding="utf-8")
         time.sleep(30)
-    elif len(sys.argv)==2 or (len(sys.argv)==4 and sys.argv[1]=="--fixture-secret"):
+    elif (len(sys.argv)==2 or (len(sys.argv)==4 and sys.argv[1]=="--fixture-secret")
+          or (len(sys.argv)==3 and sys.argv[1]=="--fixture-secret-duplicated")):
         directory = Path(sys.argv[-1]).absolute()
         try:
             if len(sys.argv)==4:consume_fixture_pipe(sys.argv[2])
+            if len(sys.argv)==3:
+                path=directory/"request.json"
+                if path.is_symlink() or path.stat().st_size>16384:raise RuntimeError("REQUEST_INVALID")
+                handle=read_request(path).get("secret_handle")
+                if type(handle) is not int or handle<=0:raise RuntimeError("PIPE_METADATA_INVALID")
+                consume_fixture_pipe(handle)
             main(directory)
         except Exception:
             # Aucun texte d'exception, corps, chemin ou environnement dans les logs.

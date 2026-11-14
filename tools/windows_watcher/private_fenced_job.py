@@ -7,6 +7,7 @@ import sys
 import time
 
 from . import private_job as jobs, private_recovery as recovery
+from .private_local_worker import read_request
 
 
 class StartupEx(ctypes.Structure):
@@ -70,13 +71,13 @@ class FencedFixtureJob(jobs.WindowsFixtureJob):
     def _launch(self, command, environment):
         # Ajouter la génération synthétique avant toute exécution du worker.
         path=self.root/"request.json"
-        if path.is_symlink() or path.stat().st_size>4096:
+        if path.is_symlink() or path.stat().st_size>16384:
             raise recovery.FenceError("REQUEST_INVALID")
-        config=json.loads(path.read_text(encoding="utf-8"))
+        config=read_request(path)
         if "generation" in config:
             raise recovery.FenceError("REQUEST_ALREADY_BOUND")
         config["generation"]=self.session
-        path.write_text(json.dumps(config),encoding="utf-8")
+        path.write_text(json.dumps(config,ensure_ascii=False),encoding="utf-8")
         attributes=self._creation_attributes()
         size=ctypes.c_size_t()
         self.api.InitializeProcThreadAttributeList(None,len(attributes),0,ctypes.byref(size))
@@ -93,7 +94,7 @@ class FencedFixtureJob(jobs.WindowsFixtureJob):
                         ctypes.byref(value),ctypes.sizeof(value),None,None):
                     raise jobs.WorkerError("JOB_ATTRIBUTE_REFUSED")
             flags=0x4|0x400|0x08000000|0x80000  # Extended startup + suspended.
-            if not self.api.CreateProcessW(sys.executable,self._creation_command(command),None,None,
+            if not self.api.CreateProcessW(self._process_executable(),self._creation_command(command),None,None,
                     self._inherit_handles(),flags,environment,str(self.root),
                     ctypes.cast(ctypes.byref(startup),ctypes.POINTER(jobs.Startup)),ctypes.byref(self.process)):
                 raise jobs.WorkerError("ATOMIC_PROCESS_CREATE")
@@ -106,6 +107,9 @@ class FencedFixtureJob(jobs.WindowsFixtureJob):
 
     def _creation_attributes(self):
         return [(0x2000D,(w.HANDLE*1)(self.job))]
+
+    def _process_executable(self):
+        return sys.executable
 
     def _creation_command(self, command):
         return command
