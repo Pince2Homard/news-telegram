@@ -2,7 +2,7 @@
 import json
 import time
 
-from . import private_contracts as contracts, private_outbox as outbox
+from . import private_boundary, private_contracts as contracts, private_outbox as outbox
 from . import private_qualification as qualification, private_recovery as recovery, private_router, private_store as base
 from . import private_bot_adapter as api, private_credential as credential, private_stop, private_trial as trial
 
@@ -10,6 +10,7 @@ from . import private_bot_adapter as api, private_credential as credential, priv
 def _bound(fence, store):
     if type(fence) is not recovery.FixtureFence or type(store) not in (outbox.DeliveryStore, qualification.QualifiedStore):
         raise recovery.FenceError("FIXTURE_REQUIRED")
+    private_boundary.shared(fence,store)
     fence.assert_active(fence.state["session"])
     if (not fence.state["dirty"] or store.path != fence.store
             or {**store.binding,"generation":store.generation} != fence.identity["binding"]):
@@ -72,6 +73,11 @@ class FixtureIntegration:
                 or stop_gate.data["session"]!=fence.state["session"]):
             raise recovery.FenceError("PRIVATE_BINDING_INVALID")
         self.fence,self.store,self.authorization=fence,store,authorization
+        self.boundary=private_boundary.shared(fence,store,authorization,stop_gate)
+        if self.boundary is not None:
+            private_boundary.check(self.boundary,store=store.root,fence=fence.root,
+                                   witness=fence.witness,trial=authorization.root,
+                                   control=stop_gate.path.parent)
         self.adapter,self.stop_gate,self.clock=adapter,stop_gate,clock
         self.target,self.enrollment=adapter.target,authorization.enrollment
         self.closed=False
@@ -79,6 +85,12 @@ class FixtureIntegration:
 
     def _admit(self):
         if self.closed:raise private_stop.StopError("ADMISSION_CLOSED")
+        boundary=private_boundary.shared(self.fence,self.store,self.authorization,self.stop_gate)
+        if boundary is not self.boundary:raise private_boundary.BoundaryError("PRIVATE_BOUNDARY_MISMATCH")
+        if boundary is not None:
+            private_boundary.check(boundary,store=self.store.root,fence=self.fence.root,
+                                   witness=self.fence.witness,trial=self.authorization.root,
+                                   control=self.stop_gate.path.parent)
         self.stop_gate.check()
         _bound(self.fence,self.store)
         if (self.adapter.target!=self.target or self.adapter.enrollment!=self.enrollment

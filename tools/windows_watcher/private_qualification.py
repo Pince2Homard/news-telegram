@@ -12,7 +12,7 @@ import sys
 import time
 from uuid import uuid4
 
-from . import coordination, credential_acl, private_outbox as delivery, private_store as base
+from . import coordination, credential_acl, private_boundary, private_outbox as delivery, private_store as base
 
 
 PREPARE_ACL = r'''
@@ -257,6 +257,7 @@ class QualifiedStore(delivery.DeliveryStore):
     def __init__(self, directory, *args, area, store_id, **kwargs):
         if type(area) is not QualificationArea or not coordination.uuid_text(store_id):
             raise base.StoreError("IDENTITY_INVALID")
+        private_boundary.check(kwargs.get("boundary"), store=directory, create=kwargs.get("create", False))
         self.area = area
         self.store_id = store_id
         directory = area.authorize(directory)
@@ -296,6 +297,7 @@ class QualifiedStore(delivery.DeliveryStore):
         return row
 
     def _guard(self, now, permission=None):
+        self._active()
         if self._qualification()["restored"]:
             raise base.StoreError("RESTORE_BARRIER")
         return super()._guard(now, permission)
@@ -315,6 +317,10 @@ class QualifiedStore(delivery.DeliveryStore):
     def backup_fixture(self, destination, now):
         """Image cohérente, toujours désarmée, dans un nouveau dossier de fixture."""
         self._active()
+        if self.boundary is not None:
+            # La frontière n'approuve aucune destination de sauvegarde : ne pas
+            # laisser ce helper de fixtures créer un dossier/une ACL hors rôle.
+            raise private_boundary.BoundaryError("PRIVATE_BACKUP_NOT_APPROVED")
         self._check_files()
         self._validate()
         now = base._time(now)
