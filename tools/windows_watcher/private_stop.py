@@ -47,15 +47,23 @@ def _ticket(path):
     return path,value
 
 
-def stop_fixture(path, *, boundary=None):
+def stop_fixture(path, *, boundary=None, expected_ticket=None):
     """Secours autonome : fermer admission, tuer, prouver. Aucune écriture SQLite.
 
     Le succès prouve l'arrêt du worker capturé ; le contrôleur doit encore
     récolter ses handles et persister son désarmement. Jamais une reprise C2.
+    Sous frontière, expected_ticket est une copie de gate.data capturée par
+    l'appelant de confiance après publish, avant l'incident. Le fichier seul
+    ne peut pas authentifier sa propre identité après une perte de confiance.
     """
     if os.name!="nt":raise StopError("WINDOWS_REQUIRED")
-    private_boundary.check(boundary,control=Path(path).absolute().parent)
+    # Secours uniquement : aucune inspection ACL, même si la frontière est
+    # déjà fermée. L'admission et tous les accès ordinaires restent gardés.
+    if boundary is not None and expected_ticket is None:
+        raise StopError("STOP_TICKET_UNPROVEN")
     _,ticket=_ticket(path)
+    if expected_ticket is not None and (type(expected_ticket) is not dict or ticket!=expected_ticket):
+        raise StopError("STOP_TICKET_CHANGED")
     kernel=_api();event=job=root=None
     try:
         event=kernel.OpenEventW(0x100000|2,False,ticket["event"])
