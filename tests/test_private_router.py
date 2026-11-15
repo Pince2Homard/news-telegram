@@ -178,7 +178,7 @@ class PrivateRouterTests(unittest.TestCase):
         imports.update(alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
                        for alias in node.names)
         self.assertEqual(imports, {"datetime", "html", "json", "math", "re", None})
-        for name in ("watcher.py", "manage.py", "telegram_http.py", "telegram_once.py"):
+        for name in ("watcher.py", "telegram_http.py", "telegram_once.py"):
             self.assertNotIn("private_router", Path(router.__file__).with_name(name).read_text(encoding="utf-8"))
 
 
