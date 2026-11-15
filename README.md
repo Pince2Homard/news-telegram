@@ -124,3 +124,14 @@ avec `--reference COMMIT`.
   [observations disponibles](docs/maintenance-observations.md) et
   [propositions fonctionnelles différées](docs/functional-proposals.md).
 - [Bilan et vérifications](docs/maintenance-results.md).
+
+## Licence et propriété intellectuelle
+
+News Telegram est proposé, pour les parties du code dont les droits le permettent, selon un régime de **double licence** :
+
+- **AGPL-3.0-only** : licence libre et copyleft, dont le texte intégral figure dans [LICENSE](LICENSE).
+- **Licence propriétaire distincte** : des permissions supplémentaires peuvent être négociées avec les titulaires des droits concernés, sans concession automatique.
+
+Consultez [LICENSING.md](LICENSING.md), [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) et [CONTRIBUTING.md](CONTRIBUTING.md) pour les conditions et limites.
+
+Copyright © 2026 Pince2Homard, uniquement pour les contributions dont les droits sont détenus sous ce pseudonyme. Aucun état civil n'est publié dans les documents de licence.
