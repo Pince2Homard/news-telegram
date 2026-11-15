@@ -1,6 +1,7 @@
 import json
 from contextlib import redirect_stdout
 import io
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -357,6 +358,7 @@ class WindowsWatcherTests(unittest.TestCase):
             self.assertEqual(self.poller.run_once()["new_events"], 1)
         self.assertEqual(self.poller.run_once()["new_events"], 0)
 
+    @unittest.skipUnless(sys.version_info[:2]==(3,12),"Watcher management requires Python 3.12")
     def test_management_install_check_prepare_and_uninstall_are_offline(self):
         root = Path(self.directory.name) / "NewsTelegramWatcher"
         with patch.object(manage.subprocess, "run", side_effect=AssertionError("no task command")), \
@@ -381,6 +383,19 @@ class WindowsWatcherTests(unittest.TestCase):
             self.assertTrue(unknown.exists())
             self.assertEqual((root / "config.json").read_bytes(), config_bytes)
             self.assertEqual((root / "state.json").read_bytes(), state_bytes)
+
+    @unittest.skipIf(sys.version_info[:2]==(3,12),"Rejection of a non-3.12 watcher runtime")
+    def test_management_refuses_non312_before_task_preparation(self):
+        root=Path(self.directory.name)/"NewsTelegramWatcher"
+        with patch.object(manage.subprocess,"run",side_effect=AssertionError("no task command")), \
+                patch.object(watcher,"urlopen",side_effect=AssertionError("no network")):
+            manage.install(root)
+            diagnosis=manage.diagnose(root)
+            self.assertFalse(diagnosis["ok"])
+            self.assertEqual(diagnosis["issues"],["Python 3.12 requis, comme la CI."])
+            with self.assertRaises(watcher.WatcherError):manage.prepare_task(root)
+            self.assertFalse((root/"task.disabled.xml").exists())
+            manage.uninstall(root)
 
     def test_management_rejects_unsafe_root_and_preserves_corrupt_config(self):
         with self.assertRaises(watcher.WatcherError):

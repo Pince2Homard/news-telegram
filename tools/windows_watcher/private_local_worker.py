@@ -120,7 +120,7 @@ def main(root):
     def phase(name):
         (root / "phase.json").write_text(json.dumps({"phase": name}), encoding="utf-8")
     if mode in {"tree", "tree_exit"}:
-        child = subprocess.Popen([sys.executable, "-I", str(Path(__file__)), "--descendant", str(root)],
+        child = subprocess.Popen([sys.executable, "-I", "-B", str(Path(__file__)), "--descendant", str(root)],
             close_fds=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         (root / "tree.json").write_text(json.dumps({"worker": os.getpid(), "child": child.pid,
             "sentinel_present": "C1_SENTINEL_NOT_A_SECRET" in os.environ}), encoding="utf-8")

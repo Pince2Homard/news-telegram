@@ -144,7 +144,7 @@ print(json.dumps(dict(calls=calls,phase=json.loads((root/'phase.json').read_text
             from tools.windows_watcher.private_job import WindowsFixtureJob
             result=WindowsFixtureJob(root,2).start().wait()
         else:
-            subprocess.run([sys.executable,"-I",str(Path(worker.__file__)),str(root)],timeout=3,check=True,capture_output=True)
+            subprocess.run([sys.executable,"-I","-B",str(Path(worker.__file__)),str(root)],timeout=3,check=True,capture_output=True)
             result=dict(safe_stop=True,timely=True,result=json.loads((root/"result.json").read_text()))
         return adapter.validate(call,result)
 

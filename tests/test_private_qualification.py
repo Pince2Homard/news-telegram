@@ -1,5 +1,6 @@
 """C0 : fixtures isolées. Windows réel activé explicitement sur l'aire approuvée."""
 from contextlib import ExitStack, closing
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -35,6 +36,48 @@ def synthetic_acl(paths):
         "protected": True, "null_dacl": False, "reparse": False,
         "rules": [{"sid": user, "allow": True, "rights": 2032127, "inherit_only": False}]}
         for path in paths]}
+
+
+def approved_profile_parent():
+    """Gate de fixture explicite ; aucune découverte ou création de chemin."""
+    try:
+        value=os.environ["PRIVATE_NATIVE_FIXTURE_ROOT"]
+        approval=int(os.environ["PRIVATE_NATIVE_FIXTURE_APPROVAL"])
+        root=base._fixture_directory(value)
+        if (not root.name.startswith("NewsTelegramPrivate-Qualification-") or
+                root.parent!=Path.home().resolve()):
+            raise ValueError("profile fixture required")
+        marker=base._safe_path(root/"ownership.json")
+        if marker.stat().st_size>4096 or marker.stat().st_nlink!=1:
+            raise ValueError("marker refused")
+        saved=json.loads(marker.read_text(encoding="utf-8"))
+        info=root.stat()
+        if (saved.get("format")!=1 or approval<=0 or saved.get("authorization")!=approval
+                or not q.coordination.uuid_text(saved.get("uuid"))
+                or root.name!="NewsTelegramPrivate-Qualification-"+saved["uuid"]
+                or [info.st_dev,info.st_ino]!=[saved.get("device"),saved.get("inode")]):
+            raise ValueError("approval identity mismatch")
+        paths=[root,*root.parents]
+        proof=q.credential_acl.inspect(paths)
+        q.credential_acl.validate(proof,paths)
+        if saved.get("sid")!=proof["user"]:
+            raise ValueError("approval owner mismatch")
+        parent=base._safe_path(root/"fixtures")
+        q.credential_acl.verify(parent)
+        return parent
+    except (KeyError,ValueError,TypeError,OSError):
+        raise base.StoreError("FIXTURE_APPROVAL_INVALID") from None
+
+
+class NativeApprovalGateTests(unittest.TestCase):
+    def test_missing_or_foreign_approval_never_reaches_acl_or_creation(self):
+        for environment in ({},{"PRIVATE_NATIVE_FIXTURE_ROOT":str(WORKSPACE),
+                "PRIVATE_NATIVE_FIXTURE_APPROVAL":"1"}):
+            with patch.dict(os.environ,environment,clear=True), \
+                    patch.object(q.credential_acl,"inspect",side_effect=AssertionError("no ACL read")), \
+                    patch.object(q,"_powershell",side_effect=AssertionError("no ACL mutation")):
+                with self.assertRaisesRegex(base.StoreError,"FIXTURE_APPROVAL_INVALID"):
+                    approved_profile_parent()
 
 
 CHILD = r'''
@@ -293,12 +336,39 @@ class QualificationTests(unittest.TestCase):
                     self.area.verify(self.source)
 
 
-@unittest.skipUnless(os.name=="nt" and os.environ.get("C0_APPROVED_WINDOWS_FIXTURE")=="1",
+@unittest.skipUnless(os.name=="nt" and os.environ.get("PRIVATE_NATIVE_FIXTURE_ROOT")
+                     and os.environ.get("PRIVATE_NATIVE_FIXTURE_APPROVAL"),
                      "Explicit native Windows fixture authorization required")
 class NativeWindowsQualificationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.area=q.QualificationArea.approved_windows_fixture()
+        cls.area=q.QualificationArea(parent=approved_profile_parent())
+
+    def saved_dacl(self,path):
+        executable=Path(os.environ["SystemRoot"])/"System32/WindowsPowerShell/v1.0/powershell.exe"
+        script=r'''$ErrorActionPreference='Stop'
+$path=[Console]::In.ReadToEnd()
+(Get-Acl -LiteralPath $path).GetSecurityDescriptorSddlForm([System.Security.AccessControl.AccessControlSections]::Access)
+'''
+        result=subprocess.run([str(executable),"-NoProfile","-NonInteractive","-Command",script],
+            input=str(path),text=True,capture_output=True,timeout=20,
+            creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
+        self.assertEqual(result.returncode,0)
+        return result.stdout.strip()
+
+    def restore_dacl(self,path,sddl,identity):
+        self.assertEqual(self.area._inode(path),identity)
+        script=r'''$ErrorActionPreference='Stop'
+$data=[Console]::In.ReadToEnd()|ConvertFrom-Json
+$directory=[System.IO.Directory]::Exists($data.path)
+if($directory){$acl=[System.Security.AccessControl.DirectorySecurity]::new()}
+else{$acl=[System.Security.AccessControl.FileSecurity]::new()}
+$acl.SetSecurityDescriptorSddlForm($data.sddl,[System.Security.AccessControl.AccessControlSections]::Access)
+if($directory){[System.IO.Directory]::SetAccessControl($data.path,$acl)}
+else{[System.IO.File]::SetAccessControl($data.path,$acl)}
+'''
+        q._powershell(script,json.dumps(dict(path=str(path),sddl=sddl)))
+        self.assertEqual(self.saved_dacl(path),sddl)
 
     @classmethod
     def tearDownClass(cls):
@@ -331,6 +401,7 @@ class NativeWindowsQualificationTests(unittest.TestCase):
         path=root/"fixtures.sqlite3"
         path.write_text("synthetic fixture",encoding="utf-8")
         identity=self.area._inode(path)
+        saved=self.saved_dacl(path)
         script=r'''
 $ErrorActionPreference='Stop'
 $path=[Console]::In.ReadToEnd()
@@ -339,26 +410,33 @@ $sid=[System.Security.Principal.SecurityIdentifier]::new('S-1-1-0')
 $acl.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new($sid,'Read','Allow'))
 [System.IO.File]::SetAccessControl($path,$acl)
 '''
-        q._powershell(script,str(path))
-        with self.assertRaisesRegex(base.StoreError,"ACL_UNSAFE"):
-            self.area.verify(root)
+        try:
+            q._powershell(script,str(path))
+            with self.assertRaisesRegex(base.StoreError,"ACL_UNSAFE"):
+                self.area.verify(root)
+        finally:self.restore_dacl(path,saved,identity)
         self.assertEqual(self.area._inode(path),identity)
+        self.assertTrue(self.area.verify(root)["acl_verified"])
         path.unlink()  # Seulement le fichier négatif créé et identifié dans ce test.
         self.assertTrue(self.area.verify(root)["acl_verified"])
 
     def test_actual_reenabled_inheritance_is_refused(self):
         root=self.area.prepare_new(self.area.reserve("native-inheritance"))
         identity=self.area._inode(root)
+        saved=self.saved_dacl(root)
         script=r'''
 $path=[Console]::In.ReadToEnd()
 $acl=[System.Security.AccessControl.DirectorySecurity]::new($path,[System.Security.AccessControl.AccessControlSections]::Access)
 $acl.SetAccessRuleProtection($false,$true)
 [System.IO.Directory]::SetAccessControl($path,$acl)
 '''
-        q._powershell(script,str(root))
-        with self.assertRaisesRegex(base.StoreError,"ACL_UNSAFE"):
-            self.area.verify(root)
+        try:
+            q._powershell(script,str(root))
+            with self.assertRaisesRegex(base.StoreError,"ACL_UNSAFE"):
+                self.area.verify(root)
+        finally:self.restore_dacl(root,saved,identity)
         self.assertEqual(self.area._inode(root),identity)
+        self.assertTrue(self.area.verify(root)["acl_verified"])
         self.assertEqual(list(root.iterdir()),[])
         root.rmdir()  # Nouveau sous-dossier de test, vide et identifié.
 

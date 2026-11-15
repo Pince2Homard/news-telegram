@@ -119,7 +119,7 @@ class LocalBankTests(unittest.TestCase):
     def run_worker(self,budget=3):
         if os.name=="nt":return jobs.WindowsFixtureJob(self.root,budget).start().wait()
         # Aucun descendant dans ce chemin portable. Aucun Job Windows revendiqué.
-        subprocess.run([sys.executable,"-I",str(Path(worker.__file__)),str(self.root)],
+        subprocess.run([sys.executable,"-I","-B",str(Path(worker.__file__)),str(self.root)],
                        timeout=budget,check=True,capture_output=True)
         return {"timely":True,"safe_stop":True,"result":json.loads((self.root/"result.json").read_text())}
 

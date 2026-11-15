@@ -124,7 +124,8 @@ class WindowsFixtureJob:
                 raise WorkerError("JOB_LIMITS")
             worker = Path(__file__).with_name("private_local_worker.py")
             command = ctypes.create_unicode_buffer(subprocess.list2cmdline(
-                [sys.executable, "-I", str(worker), str(self.root)]))
+                [sys.executable, "-I", "-B", str(worker), str(self.root)]))
+            # -I ignore PYTHONDONTWRITEBYTECODE : ne pas écrire dans la stdlib.
             # Pas d'environnement hérité susceptible de contenir un credential.
             environment = ctypes.create_unicode_buffer("\0".join([
                 "SystemRoot="+os.environ["SystemRoot"], "PYTHONDONTWRITEBYTECODE=1", "PYTHONUTF8=1", ""]) + "\0")

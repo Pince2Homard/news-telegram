@@ -176,7 +176,7 @@ class CredentialFixtureJob(fenced.FencedFixtureJob):
         return sys._base_executable
 
     def _creation_command(self, command):
-        return ctypes.create_unicode_buffer(subprocess.list2cmdline([self._process_executable(),"-I",
+        return ctypes.create_unicode_buffer(subprocess.list2cmdline([self._process_executable(),"-I","-B",
             str(Path(__file__).with_name("private_local_worker.py")),"--fixture-secret-duplicated",str(self.root)]))
 
     def _launch(self, command, environment):
