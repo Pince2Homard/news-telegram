@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from . import coordination, private_fenced_job as fenced, private_trial as trial, private_store as base
+from . import private_stop
 
 
 class CredentialError(RuntimeError):
@@ -122,7 +123,10 @@ class PinnedSyntheticProvider:
 class CredentialFixtureJob(fenced.FencedFixtureJob):
     """F2 : aucun handle héritable ; duplication vers le worker suspendu seul."""
 
-    def __init__(self, fixture, budget, fence, authorization, vault, *, action="read"):
+    def __init__(self, fixture, budget, fence, authorization, vault, *, action="read", stop_gate=None):
+        if stop_gate is not None and type(stop_gate) is not private_stop.NativeStopGate:
+            raise CredentialError("STOP_GATE_REQUIRED")
+        self.stop_gate=stop_gate
         if type(authorization) is not trial.FixtureTrial or type(vault) is not SyntheticVault or vault.closed:
             raise CredentialError("SYNTHETIC_AUTHORIZATION_REQUIRED")
         if action not in {"read","response"}:raise CredentialError("ACTION_INVALID")
@@ -151,6 +155,7 @@ class CredentialFixtureJob(fenced.FencedFixtureJob):
     def start(self):
         if self.started is not None:raise CredentialError("ALREADY_STARTED")
         try:
+            if self.stop_gate is not None:self.stop_gate.check()
             remaining=self.authorization.reserve(self.action)  # Durable avant tentative.
             if remaining<.1:raise trial.TrialError("TRIAL_EXPIRED")
             self.budget=min(self.budget,remaining)
@@ -178,6 +183,7 @@ class CredentialFixtureJob(fenced.FencedFixtureJob):
         try:
             self.deadline=min(self.deadline,self.authorization.native_deadline)
             super()._launch(command,environment)
+            if self.stop_gate is not None:self.stop_gate.publish(self)
             remote=w.HANDLE()
             if not self.api.DuplicateHandle(self.api.GetCurrentProcess(),self.read_pipe,self.process.process,
                     ctypes.byref(remote),0,False,2):
@@ -202,6 +208,10 @@ class CredentialFixtureJob(fenced.FencedFixtureJob):
         finally:
             self._close_pipes()
             self.vault.close()
+
+    def _resume(self):
+        if self.stop_gate is not None:self.stop_gate.check()
+        return super()._resume()
 
     def _close_pipes(self):
         for handle in (self.read_pipe,self.write_pipe):

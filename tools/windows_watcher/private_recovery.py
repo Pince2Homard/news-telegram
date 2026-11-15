@@ -238,6 +238,16 @@ class FixtureFence:
             self._transition("sealed", store_digest=store_digest(self.store), dirty=False)
         self.active = False
 
+    def next_operation(self):
+        """F3 : même session, après récolte attestée ; aucun réarmement de reprise."""
+        self.assert_active(self.state["session"])
+        job = self.local_job
+        if (self.state["phase"] != "stopped" or job is None or not job.safe
+                or job.final_counts["active"] != 0):
+            raise FenceError("STOP_UNPROVEN")
+        self._transition("running", job=None, owner=None)
+        self.local_job = None
+
     def recover_observed(self, observation):
         # Import local pour que la partie journal reste portable, sans WinAPI.
         from .private_fenced_job import WindowsObservation

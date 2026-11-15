@@ -17,6 +17,13 @@ EXTRA_SCHEMA = {
     "attempts": "CREATE TABLE attempts (message_id INTEGER PRIMARY KEY REFERENCES outbox(message_id), started_at REAL NOT NULL, status TEXT NOT NULL CHECK(status IN ('in_flight','confirmed','rejected','uncertain')), completed_at REAL, remote_message_id INTEGER UNIQUE, code TEXT NOT NULL CHECK(code IN ('intent','success','rejected','timeout','invalid','restart')))",
 }
 SCHEMA = {**base.SCHEMA, **EXTRA_SCHEMA}
+TRIAL_HELP = "/help — Afficher les commandes de cet essai.\n/status — Consulter l'instantané disponible."
+
+
+def trial_response_allowed(message, response):
+    return (message.get("text") in {"/help", "/status"} and response.get("command")==message["text"]
+            and response.get("code")=="ok" and
+            (message["text"]!="/help" or response.get("text")==escape(TRIAL_HELP,quote=True)))
 
 
 @dataclass(frozen=True)
@@ -231,16 +238,16 @@ class DeliveryStore(base.SimulationStore):
             self._expire(now)
         return now
 
-    def prepare(self, message_id, snapshot, now):
+    def prepare(self, message_id, snapshot, now, *, trial_only=False):
         """Calcul pur et résultat/outbox atomiques ; snapshot exclusivement injecté."""
         with self._operation():
-            if not base._positive(message_id):
+            if not base._positive(message_id) or type(trial_only) is not bool:
                 raise base.StoreError("MESSAGE_INVALID")
             now = self._guard(now)
             self.fault("before_prepare")
             with self._transaction():
                 prior = self.connection.execute("SELECT response FROM business_results WHERE message_id=?", (message_id,)).fetchone()
-                if prior:
+                if prior and not trial_only:
                     return json.loads(prior[0])
                 message = self.connection.execute("SELECT * FROM messages WHERE message_id=?", (message_id,)).fetchone()
                 if message is None or message["status"] != "pending" or now > message["date"]+120:
@@ -248,8 +255,16 @@ class DeliveryStore(base.SimulationStore):
                 payload = json.loads(message["payload"])
                 if not private_router.authenticate(payload, self.config):
                     raise base.StoreError("IDENTITY_INVALID")
-                response = private_router.route_message(payload, self.config, snapshot,
-                                                        datetime.fromtimestamp(now, timezone.utc))
+                if trial_only and payload["text"] not in {"/help", "/status"}:
+                    return None
+                if prior:
+                    response=json.loads(prior[0])
+                    return response if trial_response_allowed(payload,response) else None
+                if trial_only and payload["text"] == "/help":
+                    response = private_router._response(True, "ok", TRIAL_HELP, "/help")
+                else:
+                    response = private_router.route_message(payload, self.config, snapshot,
+                                                            datetime.fromtimestamp(now, timezone.utc))
                 self._validate_response(response)
                 digest = base._digest(response)
                 self.connection.execute("INSERT INTO business_results VALUES(?,?,?,?)",
@@ -288,26 +303,9 @@ class DeliveryStore(base.SimulationStore):
             if type(transport) is not ScriptedTransport or permission is None or not base._positive(message_id):
                 raise base.StoreError("SIMULATION_INVALID")
             now = self._guard(now, permission)
-            self.fault("before_intent")
-            with self._transaction():
-                row = self.connection.execute("""SELECT b.*,r.response FROM outbox b
-                    JOIN business_results r USING(message_id) WHERE b.message_id=?""", (message_id,)).fetchone()
-                if row is None:
-                    return "absent"
-                if row["status"] != "prepared":
-                    return row["status"]
-                starts = self.connection.execute("SELECT MAX(started_at),COUNT(*) FROM attempts WHERE started_at > ?", (now-60,)).fetchone()
-                if ((starts[0] is not None and now-starts[0] < 2) or starts[1] >= 10
-                        or now < self._identity()["cooldown_until"]):
-                    return "rate_limited"
-                response = json.loads(row["response"])
-                request = SimulatedRequest(message_id, row["destination"], row["generation"],
-                                           response["text"], row["expires_at"])
-                self.connection.execute("INSERT INTO attempts VALUES(?,?,'in_flight',NULL,NULL,'intent')", (message_id, now))
-                self.connection.execute("UPDATE outbox SET status='in_flight' WHERE message_id=?", (message_id,))
-                self._quota()
-                self.fault("before_intent_commit")
-            self.fault("after_intent_commit")
+            request = self._begin_attempt(message_id, now)
+            if type(request) is not SimulatedRequest:
+                return request
             # Appel à une classe de simulation fermée, sans callback externe.
             reply = ScriptedTransport.exchange(transport, request)
             elapsed = base._time(reply["elapsed"])
@@ -323,16 +321,62 @@ class DeliveryStore(base.SimulationStore):
                         and result.get("chat") == {"id": request.chat_id, "type": "private"}
                         and result.get("text") == unescape(request.text)):
                     status, code, remote_id = "confirmed", "success", result["message_id"]
-            with self._transaction():
-                self.connection.execute("UPDATE attempts SET status=?,completed_at=?,remote_message_id=?,code=? WHERE message_id=?",
-                                        (status, completed, remote_id, code, message_id))
-                self.connection.execute("UPDATE outbox SET status=? WHERE message_id=?", (status, message_id))
-                meta = self._meta()
-                meta["last_clock"] = completed
-                self._save_meta(meta)
-                if status == "rejected" and reply.get("retry_after", 0):
-                    self.connection.execute("UPDATE delivery_identity SET cooldown_until=? WHERE id=1", (completed+reply["retry_after"],))
-                self._quota()
-                self.fault("before_result_commit")
-            self.fault("after_result_commit")
-            return status
+            return self._finish_attempt(request, status, code, remote_id, completed,
+                                        reply.get("retry_after", 0))
+
+    def _begin_attempt(self, message_id, now):
+        """B2 partagé : appelant déjà gardé ; aucune E/S réseau dans ce module."""
+        self.fault("before_intent")
+        with self._transaction():
+            row = self.connection.execute("""SELECT b.*,r.response FROM outbox b
+                JOIN business_results r USING(message_id) WHERE b.message_id=?""", (message_id,)).fetchone()
+            if row is None:
+                return "absent"
+            if row["status"] != "prepared":
+                return row["status"]
+            starts = self.connection.execute("SELECT MAX(started_at),COUNT(*) FROM attempts WHERE started_at > ?", (now-60,)).fetchone()
+            if ((starts[0] is not None and now-starts[0] < 2) or starts[1] >= 10
+                    or now < self._identity()["cooldown_until"]):
+                return "rate_limited"
+            response = json.loads(row["response"])
+            request = SimulatedRequest(message_id, row["destination"], row["generation"],
+                                       response["text"], row["expires_at"])
+            self.connection.execute("INSERT INTO attempts VALUES(?,?,'in_flight',NULL,NULL,'intent')", (message_id, now))
+            self.connection.execute("UPDATE outbox SET status='in_flight' WHERE message_id=?", (message_id,))
+            self._quota()
+            self.fault("before_intent_commit")
+        self.fault("after_intent_commit")
+        return request
+
+    def _finish_attempt(self, request, status, code, remote_id, completed, retry_after=0):
+        """Résultat et tentative atomiques ; aucune seconde transition terminale."""
+        message_id = request.message_id
+        completed = base._time(completed)
+        if (type(request) is not SimulatedRequest
+                or status not in {"confirmed", "rejected", "uncertain"}
+                or code not in {"confirmed": {"success"}, "rejected": {"rejected"},
+                               "uncertain": {"timeout", "invalid", "restart"}}[status]
+                or (status == "confirmed") != base._positive(remote_id)
+                or type(retry_after) is not int or not 0 <= retry_after <= 86400):
+            raise base.StoreError("RESULT_INVALID")
+        self._check_files()
+        self._validate()
+        row = self.connection.execute("SELECT b.*, r.response, a.started_at FROM outbox b JOIN business_results r USING(message_id) JOIN attempts a USING(message_id) WHERE b.message_id=?", (message_id,)).fetchone()
+        if (row is None or row["status"] != "in_flight" or completed < row["started_at"]
+                or completed < self._meta()["last_clock"]
+                or request != SimulatedRequest(message_id, row["destination"], row["generation"],
+                    json.loads(row["response"])["text"], row["expires_at"])):
+            raise base.StoreError("RESULT_INVALID")
+        with self._transaction():
+            self.connection.execute("UPDATE attempts SET status=?,completed_at=?,remote_message_id=?,code=? WHERE message_id=?",
+                                    (status, completed, remote_id, code, message_id))
+            self.connection.execute("UPDATE outbox SET status=? WHERE message_id=?", (status, message_id))
+            meta = self._meta()
+            meta["last_clock"] = completed
+            self._save_meta(meta)
+            if status == "rejected" and retry_after:
+                self.connection.execute("UPDATE delivery_identity SET cooldown_until=? WHERE id=1", (completed+retry_after,))
+            self._quota()
+            self.fault("before_result_commit")
+        self.fault("after_result_commit")
+        return status

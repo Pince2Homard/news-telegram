@@ -127,7 +127,7 @@ class LocalBotAdapter:
             return {"classification":"confirmed","data":data}
         except (ValueError,TypeError,KeyError,AttributeError):return unknown
 
-    def execute(self,root,call,fence,authorization,provider,*,budget=3):
+    def execute(self,root,call,fence,authorization,provider,*,budget=3,stop_gate=None):
         if not self.enabled or type(self.endpoint) is not LocalEndpoint:
             raise TransportRefused("ADAPTER_DISABLED")
         if type(provider) is not credential.PinnedSyntheticProvider:
@@ -139,9 +139,11 @@ class LocalBotAdapter:
             vault=provider.acquire(self.target)
             self.write_fixture(root,call)
             job=credential.CredentialFixtureJob(root,budget,fence,authorization,vault,
-                action="response" if call.method=="sendMessage" else "read")
+                action="response" if call.method=="sendMessage" else "read",stop_gate=stop_gate)
             result=job.start().wait()
             outcome=self.validate(call,result)
+            if stop_gate is not None and stop_gate.requested:
+                outcome={"classification":"uncertain","code":"RESULT_UNKNOWN"}
             if outcome["classification"]!="confirmed":authorization.suspend()
             return outcome
         except (TransportRefused,credential.CredentialError,trial.TrialError):

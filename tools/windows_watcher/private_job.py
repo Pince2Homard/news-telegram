@@ -131,13 +131,16 @@ class WindowsFixtureJob:
             self._launch(command, environment)
             if time.monotonic() >= self.deadline:
                 raise WorkerError("START_EXPIRED")
-            if self.api.ResumeThread(self.process.thread) == 0xFFFFFFFF:
+            if self._resume() == 0xFFFFFFFF:
                 raise WorkerError("PROCESS_RESUME")
             self.trace.append("resumed")
             return self
         except BaseException:
             self.stop()
             raise
+
+    def _resume(self):
+        return self.api.ResumeThread(self.process.thread)
 
     def _new_job(self):
         return self.api.CreateJobObjectW(None, None)
