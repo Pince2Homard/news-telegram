@@ -1,0 +1,129 @@
+{
+  "audit_findings": 0,
+  "audit_packages": 32,
+  "initial_suite": {
+    "class_errors": 1,
+    "failures": 1,
+    "skipped": 1,
+    "tests": 442
+  },
+  "matching_python_processes_after_suite": 0,
+  "native_classes": {
+    "test_private_f3.WindowsIntegration": 6,
+    "test_private_qualification.NativeWindowsQualificationTests": 3,
+    "test_private_recovery.NativeRecoveryTests": 8,
+    "test_private_runtime_qualification.NativeRuntimePrerequisites": 3,
+    "test_private_transport.WindowsTransferTests": 4,
+    "test_private_trial.NativeTrialTests": 10,
+    "test_private_worker.WindowsJobTests": 11
+  },
+  "quality": [
+    {
+      "exit": 0,
+      "tool": "ruff"
+    },
+    {
+      "exit": 0,
+      "tool": "compileall"
+    },
+    {
+      "exit": 0,
+      "tool": "pip check"
+    }
+  ],
+  "root_private_acl_verified_after_suite": false,
+  "runtime_delta": {
+    "added": {
+      "Lib/__pycache__/stringprep.cpython-315.pyc": {
+        "bytes": 54420,
+        "sha256": "5a9574f98f91dafca0dae11b4f9f64480e97106db4a855d6914acc4bdc9facb0"
+      },
+      "Lib/encodings/__pycache__/idna.cpython-315.pyc": {
+        "bytes": 15119,
+        "sha256": "f74a24345cfe40039c6128c0d0c3144afff047f261ac1e288235f94c89de9053"
+      }
+    },
+    "changed": [],
+    "existing_files": 2471,
+    "removed": []
+  },
+  "suite": {
+    "errors": [],
+    "failures": [],
+    "main_process_network_guard": {
+      "blocked": 1,
+      "loopback_bind": 74,
+      "loopback_connect": 0
+    },
+    "python": "3.15.2",
+    "skipped": [
+      {
+        "reason": "POSIX file modes",
+        "test": "test_posix_permissions_are_restrictive_and_unsafe_modes_refused (test_private_store.PrivateStoreTests.test_posix_permissions_are_restrictive_and_unsafe_modes_refused)"
+      },
+      {
+        "reason": "Watcher management requires Python 3.12",
+        "test": "test_management_install_check_prepare_and_uninstall_are_offline (test_windows_watcher.WindowsWatcherTests.test_management_install_check_prepare_and_uninstall_are_offline)"
+      }
+    ],
+    "successful": true,
+    "tests": 446
+  },
+  "target": {
+    "base_executable_matches": true,
+    "gil": true,
+    "openssl": "OpenSSL 3.5.9 29 Sep 2026",
+    "packages": {
+      "boolean-py": "5.0",
+      "cachecontrol": "0.14.4",
+      "certifi": "2026.10.23",
+      "charset-normalizer": "3.5.2",
+      "coverage": "7.17.2",
+      "cyclonedx-python-lib": "11.12.0",
+      "defusedxml": "0.7.1",
+      "feedparser": "6.0.11",
+      "filelock": "4.2.10",
+      "idna": "3.20",
+      "license-expression": "30.4.4",
+      "markdown-it-py": "4.3.0",
+      "mdurl": "0.1.2",
+      "msgpack": "1.2.4",
+      "packageurl-python": "0.17.6",
+      "packaging": "26.3",
+      "pip": "26.2.2",
+      "pip-api": "0.0.35",
+      "pip-audit": "2.10.1",
+      "pip-requirements-parser": "32.0.1",
+      "platformdirs": "4.14.5",
+      "py-serializable": "2.2.0",
+      "pygments": "2.21.0",
+      "pyparsing": "3.3.3",
+      "requests": "2.34.2",
+      "rich": "15.0.0",
+      "ruff": "0.14.0",
+      "sgmllib3k": "1.0.0",
+      "sortedcontainers": "2.4.0",
+      "tomli": "2.5.0",
+      "tomli-w": "1.2.0",
+      "urllib3": "2.8.0"
+    },
+    "python": "3.15.2",
+    "site_packages_isolated": true,
+    "sqlite": "3.53.4"
+  },
+  "tested_files": {
+    "tests/test_private_qualification.py": "4911f504613f26d85f7c92e157dab11773b75ce52862dc19997074855d6275f2",
+    "tests/test_private_transport.py": "1e659c1cdfe98e1208b77a711a6357d300b57495d8d9f6cf933795af2cbd7cec",
+    "tests/test_private_worker.py": "b75e1c6b64097eff7d00111bd6c1cf6306aededb2bde237206413aca2dbcb55e",
+    "tests/test_windows_watcher.py": "8c5412382c738e9328675d366101bfb90a45718d48c00073aaf2ba2a70301867",
+    "tools/windows_watcher/private_credential.py": "f10c863ab5f483f861f3d07961bfd2439c6ca5996ff3ef987fa6a3e45321616b",
+    "tools/windows_watcher/private_job.py": "82bd0e2894c17f1d3b5223d505c3c9a2a465f537eb9531acdee2e37c093fdaf7",
+    "tools/windows_watcher/private_local_worker.py": "f88c6abdbb33826e7d168becc3838c6cd2fd4aee904324eb30947480b6bc8d91"
+  },
+  "windows312": {
+    "historical_sha": "6ec7b44ca61c318f16290dfbfd1e7ed03a276113",
+    "historical_skips": 4,
+    "historical_tests": 444,
+    "new_windows_run": false
+  }
+}
