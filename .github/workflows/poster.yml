@@ -2,8 +2,8 @@ name: Poster news
 
 on:
   schedule:
-    # GitHub Actions ne descend pas sous 5 minutes ; le décalage évite :00.
-    - cron: "2/5 * * * *"
+    # Essai 48 h : toutes les 15 minutes, en évitant :00.
+    - cron: "2,17,32,47 * * * *"
   workflow_dispatch:
 
 concurrency:
