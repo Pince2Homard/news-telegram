@@ -6,7 +6,7 @@ import os
 import sys
 import time
 
-from . import private_job as jobs, private_recovery as recovery
+from . import private_boundary, private_job as jobs, private_recovery as recovery
 from .private_local_worker import read_request
 
 
@@ -42,6 +42,7 @@ class FencedFixtureJob(jobs.WindowsFixtureJob):
         if type(fence) is not recovery.FixtureFence:
             raise recovery.FenceError("FENCE_REQUIRED")
         fence.assert_active(fence.state["session"])
+        private_boundary.check(fence.boundary,control=fixture)
         if fence.state["phase"]!="running" or fence.local_job is not None:
             raise recovery.FenceError("JOB_ALREADY_BOUND")
         super().__init__(fixture,budget)
@@ -69,6 +70,7 @@ class FencedFixtureJob(jobs.WindowsFixtureJob):
         return handle
 
     def _launch(self, command, environment):
+        private_boundary.check(self.fence.boundary,control=self.root)
         # Ajouter la génération synthétique avant toute exécution du worker.
         path=self.root/"request.json"
         if path.is_symlink() or path.stat().st_size>16384:

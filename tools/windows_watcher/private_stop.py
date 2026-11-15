@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import time
 
-from . import coordination, private_fenced_job as native, private_job as jobs, private_store as base
+from . import coordination, private_boundary, private_fenced_job as native, private_job as jobs, private_store as base
 from .private_local_worker import read_request
 
 
@@ -47,14 +47,23 @@ def _ticket(path):
     return path,value
 
 
-def stop_fixture(path):
+def stop_fixture(path, *, boundary=None, expected_ticket=None):
     """Secours autonome : fermer admission, tuer, prouver. Aucune écriture SQLite.
 
     Le succès prouve l'arrêt du worker capturé ; le contrôleur doit encore
     récolter ses handles et persister son désarmement. Jamais une reprise C2.
+    Sous frontière, expected_ticket est une copie de gate.data capturée par
+    l'appelant de confiance après publish, avant l'incident. Le fichier seul
+    ne peut pas authentifier sa propre identité après une perte de confiance.
     """
     if os.name!="nt":raise StopError("WINDOWS_REQUIRED")
+    # Secours uniquement : aucune inspection ACL, même si la frontière est
+    # déjà fermée. L'admission et tous les accès ordinaires restent gardés.
+    if boundary is not None and expected_ticket is None:
+        raise StopError("STOP_TICKET_UNPROVEN")
     _,ticket=_ticket(path)
+    if expected_ticket is not None and (type(expected_ticket) is not dict or ticket!=expected_ticket):
+        raise StopError("STOP_TICKET_CHANGED")
     kernel=_api();event=job=root=None
     try:
         event=kernel.OpenEventW(0x100000|2,False,ticket["event"])
@@ -90,9 +99,11 @@ def stop_fixture(path):
 class NativeStopGate:
     """Événement latché, jamais réarmé. Pas de thread ni de second moteur."""
 
-    def __init__(self,directory,session):
+    def __init__(self,directory,session,*,boundary=None):
         if os.name!="nt" or not coordination.uuid_text(session):raise StopError("FIXTURE_REQUIRED")
+        private_boundary.check(boundary,control=directory)
         root=base._fixture_directory(directory)
+        self.boundary=boundary
         self.path=root/"stop-ticket.json"
         if not root.is_dir() or self.path.exists():raise StopError("STOP_TICKET_EXISTS")
         self.api=_api();self.handle=None;self.job=None
@@ -122,6 +133,8 @@ class NativeStopGate:
         return status==0
 
     def check(self):
+        boundary=getattr(self,"boundary",None)
+        if boundary is not None:private_boundary.check(boundary,control=self.path.parent)
         if self.requested:raise StopError("ADMISSION_CLOSED")
 
     def publish(self,job):

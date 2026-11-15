@@ -7,10 +7,11 @@ from contextlib import ExitStack
 import hashlib
 import json
 import os
+from pathlib import Path
 import sqlite3
 from uuid import uuid4
 
-from . import coordination, private_store as base, watcher
+from . import coordination, private_boundary, private_store as base, watcher
 
 
 class FenceError(RuntimeError):
@@ -45,7 +46,9 @@ class FixtureFence:
     n'est jamais effacé par __exit__. Deux commits distincts : désaccord = blocage.
     """
 
-    def __init__(self, directory, witness, store, binding, now, *, create=False, fault=None):
+    def __init__(self, directory, witness, store, binding, now, *, create=False, fault=None, boundary=None):
+        private_boundary.check(boundary, fence=directory, witness=witness,
+                               store=Path(store).parent, create=create)
         self.root, self.witness, self.store = map(base._fixture_directory, (directory, witness, store))
         paths = (self.root, self.witness, self.store.parent)
         if any(a == b or a in b.parents or b in a.parents for i,a in enumerate(paths) for b in paths[i+1:]):
@@ -67,9 +70,19 @@ class FixtureFence:
         self.active = False
         self.poisoned = False
         self.local_job = None
+        self.boundary = boundary
+
+    def _check_boundary(self, *, create=False):
+        try:
+            private_boundary.check(self.boundary, fence=self.root, witness=self.witness,
+                                   store=self.store.parent, create=create)
+        except private_boundary.BoundaryError:
+            self.poisoned = True
+            raise
 
     def __enter__(self):
         try:
+            self._check_boundary(create=self.create)
             if self.create:
                 # Ni adoption de dossier existant, ni recréation d'une preuve perdue.
                 for root in (self.root, self.witness):
@@ -136,6 +149,7 @@ class FixtureFence:
             raise stop_error
 
     def _read(self):
+        self._check_boundary()
         histories = []
         for connection in self.connections:
             if (connection.execute("PRAGMA user_version").fetchone()[0] != 1
@@ -172,9 +186,11 @@ class FixtureFence:
         digest = _hash(self.previous+payload)
         try:
             for index,connection in enumerate(self.connections):
+                self._check_boundary()
                 connection.execute("BEGIN IMMEDIATE")
                 try:
                     connection.execute("INSERT INTO events VALUES(?,?,?,?)", (self.seq+1,payload,self.previous,digest))
+                    self._check_boundary()
                     connection.execute("COMMIT")
                 except BaseException:
                     if connection.in_transaction:connection.execute("ROLLBACK")
@@ -190,6 +206,7 @@ class FixtureFence:
         self._append({**self.state, **changes, "phase": phase, "clock": self.now})
 
     def begin(self):
+        self._check_boundary()
         if self.active or self.poisoned or self.state["phase"] != "sealed":
             raise FenceError("PREVIOUS_SESSION_UNPROVEN")
         if store_digest(self.store) != self.state["store_digest"]:
@@ -199,6 +216,7 @@ class FixtureFence:
         return self.state["session"]
 
     def assert_active(self, session):
+        self._check_boundary()
         if (not self.active or self.poisoned or session != self.state["session"]
                 or self.state["phase"] not in {"running","intent","stopping","stopped"}):
             raise FenceError("STALE_GENERATION")
@@ -256,6 +274,7 @@ class FixtureFence:
                 or observation.name != self.state["job"] or observation.owner != self.state["owner"]):
             raise FenceError("OBSERVATION_MISMATCH")
         observation.terminate_and_prove()
+        self._check_boundary()
         # Une écriture interrompue sans checkpoint externe complet reste désarmée :
         # un ancien snapshot pourrait avoir perdu une intention déjà acceptée.
         with watcher.single_instance_lock(self.store.parent/"fixture.lock"):

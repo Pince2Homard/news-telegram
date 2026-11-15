@@ -6,7 +6,7 @@ import os
 import sqlite3
 import time
 
-from . import coordination, private_store as base, watcher
+from . import coordination, private_boundary, private_store as base, watcher
 
 
 class TrialError(RuntimeError):
@@ -56,9 +56,10 @@ class FixtureTrial:
     """
 
     def __init__(self, directory, enrollment, plan=FixturePlan(), *, create=False,
-                 wall=time.time, monotonic=time.monotonic):
+                 wall=time.time, monotonic=time.monotonic, boundary=None):
         if type(enrollment) is not ManualFixtureEnrollment or type(plan) is not FixturePlan or type(create) is not bool:
             raise TrialError("FIXTURE_REQUIRED")
+        private_boundary.check(boundary,trial=directory,create=create)
         self.root=base._fixture_directory(directory)
         self.enrollment,self.plan,self.create=enrollment,plan,create
         self.wall,self.monotonic=wall,monotonic
@@ -66,9 +67,11 @@ class FixtureTrial:
         self.started_mono=self.last_mono=None
         self.native_deadline=None
         self.failed=False
+        self.boundary=boundary
 
     def __enter__(self):
         try:
+            private_boundary.check(self.boundary,trial=self.root,create=self.create)
             if self.create:self.root.mkdir(mode=0o700,exist_ok=False)
             if not self.root.is_dir():raise TrialError("TRIAL_MISSING")
             self.lock=watcher.single_instance_lock(self.root/"trial.lock")
@@ -121,6 +124,7 @@ class FixtureTrial:
         if stop_error is not None:raise stop_error
 
     def _files(self):
+        private_boundary.check(self.boundary,trial=self.root)
         base._safe_path(self.root)
         for path in self.root.iterdir():
             base._safe_path(path)
@@ -131,8 +135,10 @@ class FixtureTrial:
     @contextmanager
     def _transaction(self):
         try:
+            private_boundary.check(self.boundary,trial=self.root)
             self.db.execute("BEGIN IMMEDIATE")
             yield
+            private_boundary.check(self.boundary,trial=self.root)
             self.db.execute("COMMIT")
         except BaseException:
             if self.db.in_transaction:self.db.execute("ROLLBACK")
@@ -140,6 +146,7 @@ class FixtureTrial:
             raise
 
     def _read(self):
+        private_boundary.check(self.boundary,trial=self.root)
         if (self.db.execute("PRAGMA user_version").fetchone()[0]!=1
                 or dict(self.db.execute("SELECT name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"))!={"trial":SCHEMA}
                 or self.db.execute("PRAGMA integrity_check").fetchone()[0]!="ok"):
@@ -211,4 +218,5 @@ class FixtureTrial:
             self._save(state="recovery_required")
 
     def status(self):
+        private_boundary.check(self.boundary,trial=self.root)
         return {key:self.data[key] for key in ("state","reads","responses")}

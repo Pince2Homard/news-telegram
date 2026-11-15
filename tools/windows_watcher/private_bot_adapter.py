@@ -136,6 +136,10 @@ class LocalBotAdapter:
             raise TransportRefused("ENROLLMENT_MISMATCH")
         job=None
         try:
+            from . import private_boundary
+            resources=(fence,authorization) if stop_gate is None else (fence,authorization,stop_gate)
+            boundary=private_boundary.shared(*resources)
+            private_boundary.check(boundary,control=root)
             vault=provider.acquire(self.target)
             self.write_fixture(root,call)
             job=credential.CredentialFixtureJob(root,budget,fence,authorization,vault,

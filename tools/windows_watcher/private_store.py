@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 
-from . import credential_acl, private_router, supervision, watcher
+from . import credential_acl, private_boundary, private_router, supervision, watcher
 
 
 SCHEMA_VERSION = 1
@@ -84,7 +84,7 @@ class SimulationStore:
 
     def __init__(self, directory, config, bot_id, now, *, create=False,
                  receipt_limit=MAX_RECEIPTS, pending_limit=MAX_PENDING,
-                 database_bytes=MAX_DATABASE_BYTES, fault=None):
+                 database_bytes=MAX_DATABASE_BYTES, fault=None, boundary=None):
         if type(create) is not bool:
             raise StoreError("MODE_INVALID")
         try:
@@ -98,6 +98,7 @@ class SimulationStore:
                                (database_bytes, MAX_DATABASE_BYTES)):
             if type(value) is not int or not 1 <= value <= maximum:
                 raise StoreError("QUOTA_INVALID")
+        private_boundary.check(boundary, store=directory, create=create)
         self.root = _fixture_directory(directory)
         self.path = self.root / "fixtures.sqlite3"
         self.marker = self.root / "fixture-identity.json"
@@ -111,9 +112,11 @@ class SimulationStore:
         self.connection = None
         self.lock = None
         self.failed = False
+        self.boundary = boundary
 
     def __enter__(self):
         try:
+            private_boundary.check(self.boundary, store=self.root, create=self.create)
             if self.create:
                 # Un dossier préexistant, même vide, ne devient pas un nouveau magasin.
                 self.root.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -192,6 +195,7 @@ class SimulationStore:
     def _active(self):
         if self.connection is None or self.failed:
             raise StoreError("SESSION_CLOSED")
+        private_boundary.check(self.boundary, store=self.root)
 
     def _on_open(self):
         """Point d'extension de reprise, sans effet pour le schéma B1."""
@@ -205,6 +209,7 @@ class SimulationStore:
         try:
             self.connection.execute("BEGIN IMMEDIATE")
             yield
+            private_boundary.check(self.boundary, store=self.root)
             self.connection.execute("COMMIT")
         except BaseException:
             if self.connection.in_transaction:
@@ -212,6 +217,7 @@ class SimulationStore:
             raise
 
     def _check_files(self):
+        private_boundary.check(self.boundary, store=self.root)
         _safe_path(self.root)
         if os.name != "nt" and self.root.stat().st_mode & 0o077:
             raise StoreError("FILES_UNSAFE")
