@@ -27,11 +27,9 @@ exacte et reste bloqué par le journal de cet essai. Il n'existe pas de liaison
 automatique entre les événements du watcher et Telegram. Les commandes réelles
 ne sont pas des commandes d'installation ni des exemples à rejouer.
 
-Compatibilité : le watcher Windows conserve son registre, sa configuration et
-son manifeste d'installation actuels. Les modules Telegram ne sont pas ajoutés
-automatiquement par manage.py install et s'utilisent explicitement depuis le
-dépôt de développement. La fusion ne constitue ni une installation locale ni
-une activation de service ou de tâche.
+Le parcours ponctuel reste disponible depuis le depot, sans installation locale.
+L'installateur Windows a ete retire lors du nettoyage #43. Les installations
+et journaux existants sur le poste ne sont pas modifies.
 
 Risques résiduels : résultat réseau ambigu sans preuve de non-livraison, perte
 du verrou anti-doublons si le propriétaire supprime volontairement le journal,
