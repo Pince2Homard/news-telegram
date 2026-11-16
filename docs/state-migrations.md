@@ -54,3 +54,26 @@ retrouver automatiquement tout le canal.
 Toute future modification de format exige une migration testée sur copie et une
 conversion inverse ou procédure de restauration explicitement vérifiée. Les
 pistes de file unique ne sont pas une migration déjà disponible.
+
+
+## Métadonnées de reprise automatique
+
+Le format reste v2 ; v1 reconnu et ancien état actif sans `init` restent admis.
+Les champs optionnels `delivery_retry` d'un article et `last_attempt_at` de l'état
+ne constituent ni un manifeste ni une preuve de livraison. `delivery_retry`
+contient `uncertain_count` (entier 0 à 3), `last_attempt_at` et `not_before`
+(dates finies positives cohérentes). Leur absence conserve le comportement
+historique : zéro tentative incertaine connue, aucune date fabriquée.
+
+Un état existant doit contenir `file` ; `vus` est requis s'il existe des preuves
+d'activité. Les articles de file ont un texte et un lien HTTP(S). Versions
+inconnues, nombres non finis et structures inutilisables sont refusés sans
+écrasement. En publication réelle, un fichier absent est refusé ; le véritable
+amorçage doit être préparé explicitement hors publication. Aucun ancien fichier
+n'est restauré automatiquement.
+
+Les essais d'écriture (trois au maximum, pauses 1 puis 5 secondes) répètent le
+même candidat validé, jamais l'envoi réseau. La rétention existante de 500 entrées
+`erreurs` reste bornée ; les retraits supplémentaires sont journalisés et comptés
+par `quarantine_pruned`. Le contenu d'un article mis à l'écart reste consultable
+jusqu'à cette rétention, et dans les commits qui l'ont enregistré.

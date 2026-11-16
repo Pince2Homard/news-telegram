@@ -13,6 +13,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
   poster:
@@ -32,7 +33,18 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Vérifier le passage précédent
+        id: health
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python tools/persistence_health.py gate >> "$GITHUB_OUTPUT"
+      - name: Contrôler la persistance sans Telegram
+        id: probe
+        if: steps.health.outputs.mode == 'recovery'
+        run: python tools/persistence_health.py probe
       - name: Publier les articles
+        id: publish
+        if: steps.health.outputs.mode == 'normal'
         run: python poster.py
         env:
           DRY_RUN: "0"
@@ -41,19 +53,5 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
       - name: Sauvegarder l'état de la file d'attente
-        if: always()
-        run: |
-          git config user.name "bot"
-          git config user.email "bot@users.noreply.github.com"
-          git add state.json
-          if git diff --cached --quiet; then
-            echo "Aucun changement d'état à enregistrer."
-            exit 0
-          fi
-          git commit -m "État du bot"
-          for attempt in 1 2 3 4 5; do
-            git pull --rebase origin main && git push && exit 0
-            sleep 5
-          done
-          echo "Impossible de sauvegarder state.json après 5 tentatives."
-          exit 1
+        if: always() && steps.health.outcome == 'success' && (steps.publish.outcome != 'skipped' || steps.probe.outcome == 'success')
+        run: python tools/persistence_health.py sync

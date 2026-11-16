@@ -36,7 +36,7 @@ def main():
     run_started_epoch = time.time()
     feeds = load_feeds(os.getenv("FEEDS_FILE", "feeds.txt"))
     state_path = os.getenv("STATE_FILE", "state.json")
-    state = load_state(state_path)
+    state = load_state(state_path, allow_new=dry_run)
     state.setdefault("admission_buffer", [])
     state.setdefault("date_quarantine", [])
     state.setdefault("url_seen", [])
@@ -117,6 +117,8 @@ def main():
     save_state(state, seen, state_path)
     metrics["total_seconds"] = round(time.monotonic() - run_started, 3)
     _log_phase51_metrics(metrics)
+    if metrics.get("publication_failed"):
+        raise RuntimeError("Publication interrompue : reprise automatique différée")
 
 
 if __name__ == "__main__":

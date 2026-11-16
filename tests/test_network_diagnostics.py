@@ -77,7 +77,8 @@ class NetworkDiagnosticsTests(unittest.TestCase):
                 time_limit=400, sleep=sleep,
             )
         self.assertEqual(sent, 0)
-        self.assertEqual(state["file"], before)
+        self.assertEqual([{k: v for k, v in item.items() if k != "delivery_retry"}
+                          for item in state["file"]], before)
         transport.post.assert_called_once()
         sleep.assert_not_called()
         output = str(logs.call_args_list)

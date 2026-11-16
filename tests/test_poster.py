@@ -822,13 +822,14 @@ class PosterSafetyTests(unittest.TestCase):
 
     def test_send_message_retries_only_explicit_telegram_rate_limit(self):
         rate_limit = Mock(ok=False, status_code=429)
-        rate_limit.json.return_value = {"parameters": {"retry_after": 2}}
+        rate_limit.json.return_value = {"ok": False, "error_code": 429, "parameters": {"retry_after": 2}}
         success = Mock(ok=True, status_code=200)
+        success.json.return_value = {"ok": True, "result": {"message_id": 1, "date": 1700000123, "chat": {"id": 42}}}
         transport = Mock()
         transport.post.side_effect = [rate_limit, success]
         sleeper = Mock()
         self.assertTrue(publication.send_message(
-            {"text": "test"}, "fake-token", "fake-chat", http=transport, sleep=sleeper,
+            {"text": "test"}, "fake-token", "42", http=transport, sleep=sleeper,
         ))
         self.assertEqual(transport.post.call_count, 2)
         sleeper.assert_called_once_with(2)
@@ -836,14 +837,14 @@ class PosterSafetyTests(unittest.TestCase):
     def test_send_message_logs_utc_duration_and_message_id_without_credentials(self):
         response = Mock(ok=True, status_code=200)
         response.json.return_value = {
-            "ok": True, "result": {"message_id": 987, "date": 1700000123},
+            "ok": True, "result": {"message_id": 987, "date": 1700000123, "chat": {"id": 42}},
         }
         transport = Mock()
         transport.post.return_value = response
         fake_clock = FakeClock(1700000124)
         with patch("builtins.print") as log:
             result = publication.send_message(
-                {"text": "test"}, "sensitive-token", "sensitive-chat",
+                {"text": "test"}, "sensitive-token", "42",
                 http=transport, clock=fake_clock, monotonic=fake_clock,
             )
         self.assertTrue(result)
@@ -1091,7 +1092,8 @@ class PosterSafetyTests(unittest.TestCase):
 
 
     def test_send_message_marks_permanent_client_errors(self):
-        response = Mock(ok=False, status_code=400, text="chat not found")
+        response = Mock(ok=False, status_code=400)
+        response.json.return_value = {"ok": False, "error_code": 400, "description": "message is too long"}
         transport = Mock()
         transport.post.return_value = response
         with self.assertRaises(publication.PermanentTelegramError):
@@ -1108,7 +1110,7 @@ class PosterSafetyTests(unittest.TestCase):
             state = {"vus": [], "file": [bad, good], "erreurs": [], "feeds": [], "yt": {}, "v": 2}
             def sender(item, token, chat_id):
                 if item is bad:
-                    raise publication.PermanentTelegramError("HTTP 400: chat not found")
+                    raise publication.PermanentTelegramError("HTTP 400: message is too long")
                 return True
             sent = publication.process_queue(
                 state, {}, "token", "chat", state_path=path, dry_run=False,
