@@ -141,6 +141,11 @@ def send_message(
             http_errors += 1
             sleep(wait)
             continue
+        if status in (401, 403):
+            # Even an invalid error envelope must not exhaust every article
+            # when credentials/permissions are suspect. This is a global stop,
+            # not a claim that the malformed response proves non-acceptance.
+            raise GlobalTelegramError(f"HTTP {status}", http_status=status)
         if not valid_error:
             return TelegramSendResult(False, attempt_errors=1)
 

@@ -146,6 +146,15 @@ class AutomaticRecoveryTests(unittest.TestCase):
             synchronize(run)
         self.assertEqual(sum("push" in c.args[0] for c in run.call_args_list), 1)
 
+    def test_malformed_authentication_error_preserves_queue(self):
+        for status in (401, 403):
+            http = Mock()
+            http.post.return_value = Mock(status_code=status)
+            http.post.return_value.json.side_effect = ValueError("synthetic HTML")
+            with self.assertRaises(publication.GlobalTelegramError):
+                publication.send_message({"text": "synthetic"}, "fake", "42", http=http)
+            http.post.assert_called_once()
+
     def test_long_rate_limit_is_rejected_and_deferred_without_clamping(self):
         http = Mock()
         http.post.return_value = Mock(status_code=429)
