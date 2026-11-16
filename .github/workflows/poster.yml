@@ -3,7 +3,7 @@ name: Poster news
 on:
   schedule:
     # Essai 48 h : toutes les 15 minutes, en évitant :00.
-    - cron: "2,17,32,47 * * * *"
+    - cron: "2/5 * * * *"
   workflow_dispatch:
 
 concurrency:
