@@ -201,11 +201,11 @@ class CollectionSessionTests(unittest.TestCase):
                 patch.object(session, "close", wraps=session.close) as close, \
                 patch.object(session, "post") as rss_post, \
                 patch.object(publication.requests, "post", return_value=Mock(
-                    ok=True, status_code=200, json=Mock(return_value={"result": {"message_id": 1}}),
+                    ok=True, status_code=200, json=Mock(return_value={"ok": True, "result": {"message_id": 1, "date": 1000, "chat": {"id": 42}}}),
                 )) as telegram_post, redirect_stdout(io.StringIO()):
             self.collect(state(), parser=Mock(return_value=Mock(entries=[])))
             close.assert_called_once_with()
-            result = publication.send_message({"text": "synthetic"}, "synthetic", "synthetic")
+            result = publication.send_message({"text": "synthetic"}, "synthetic", "42")
         self.assertTrue(result.success)
         factory.assert_called_once_with()
         rss_post.assert_not_called()

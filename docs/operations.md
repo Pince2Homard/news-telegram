@@ -98,3 +98,37 @@ sauvegardes locales atomiques restent en place. Aucun achat, provisionnement,
 nouveau stockage ou développement pour ce matériel n'est engagé. Sa disponibilité
 ouvrira un chantier distinct, selon les contraintes consignées dans les
 [propositions différées](functional-proposals.md#hébergement-et-limites-de-livraison).
+
+
+## Reprise automatique simplifiée (proposition non déployée)
+
+Voir [le contrat et la validation](automatic-recovery.md). Le workflow proposé
+consulte le précédent passage de `poster.yml` et sa tentative. Après échec,
+annulation ou résultat inconnu, il effectue un passage de récupération sans
+credential Telegram : état canonique valide, marqueur `persistence_check`, puis
+commit/push vérifié. Un passage de récupération réussi permet la publication
+au prochain passage normal. La lecture nécessite `actions: read` sur le token
+éphémère Actions ; aucun PAT supplémentaire.
+
+Un incident réseau devient une reprise différée (15 puis 30 minutes), pas un
+manifeste ouvert. Après trois incertitudes enregistrées, l'article est conservé
+dans `erreurs` avec `possible_delivery: true`, puis les autres articles peuvent
+reprendre. Le passage incertain échoue explicitement ; un passage de santé peut
+donc s'intercaler avant la reprise. Une corruption/configuration invalide reste
+un refus : ne jamais supprimer l'état ou réinitialiser la file pour la contourner.
+
+Ne pas lancer manuellement `tools/persistence_health.py probe/sync` contre la
+production sans autorisation. `DRY_RUN=1` rend ces commandes sans écriture.
+
+
+### Mode dégradé si seule l'API Actions est indisponible
+
+Une erreur de lecture d'historique retourne `mode=degraded`. Le même passage
+prépare une sonde et exige son push ET sa vérification distante avant d'exécuter
+publish. Si cette vérification échoue, publish reste skipped. Si elle réussit,
+la publication bornée reprend immédiatement, sans attendre le retour de l'API.
+La sonde n'utilise pas de credential Telegram ; celui-ci reste limité au step
+publish. Budget de publication réduit d'une minute dans ce seul mode afin de
+réserver la vérification Git supplémentaire, limite du job inchangée.
+Un 429 valide sans retry_after est reporté de 15 minutes comme rejet certain,
+sans incertitude ni quarantaine ; le délai entier positif fourni prime toujours.
