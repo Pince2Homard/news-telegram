@@ -1,6 +1,8 @@
 """Orchestration de la collecte et de la diffusion Telegram."""
 import os
 import time
+import subprocess
+from pathlib import Path
 from newsbot.collection import load_feeds, collect_articles
 from newsbot.persistence import load_state, save_state
 from newsbot.publication import process_queue
@@ -11,6 +13,15 @@ from newsbot.settings import (
 from newsbot.metrics import (
     _utc_iso, _oldest_pending_age_seconds, _store_run_metrics, _log_phase51_metrics,
 )
+from tools.persistence_health import synchronize
+
+
+def checkpoint_remote():
+    """Reuse the verified Git checkpoint; no sender or additional retry layer."""
+    def run(args, timeout):
+        return subprocess.run(args, capture_output=True, text=True,
+                              check=True, timeout=timeout).stdout
+    synchronize(run)
 
 
 def main():
@@ -39,6 +50,8 @@ def main():
     run_budget = RUN_BUDGET - (60 if os.getenv("PERSISTENCE_MODE") == "degraded" else 0)
     feeds = load_feeds(os.getenv("FEEDS_FILE", "feeds.txt"))
     state_path = os.getenv("STATE_FILE", "state.json")
+    if not dry_run and Path(state_path).resolve() != Path("state.json").resolve():
+        raise RuntimeError("Publication refusée : checkpoint Git limité à state.json")
     state = load_state(state_path, allow_new=dry_run)
     state.setdefault("admission_buffer", [])
     state.setdefault("date_quarantine", [])
@@ -104,6 +117,7 @@ def main():
     process_queue(
         state, seen, token, chat_id, state_path=state_path, dry_run=False,
         interval_seconds=interval_seconds, time_limit=remaining, metrics=metrics,
+        remote_checkpoint=checkpoint_remote,
     )
     metrics["queue_after_publication"] = metrics.get("queue_final", len(state["file"]))
     metrics["admission_buffer_final"] = len(state["admission_buffer"])
