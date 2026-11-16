@@ -34,6 +34,9 @@ def main():
 
     run_started = time.monotonic()
     run_started_epoch = time.time()
+    # A verified degraded preflight can consume 60 s before this process starts.
+    # Reserve that extra time within the existing Actions job budget.
+    run_budget = RUN_BUDGET - (60 if os.getenv("PERSISTENCE_MODE") == "degraded" else 0)
     feeds = load_feeds(os.getenv("FEEDS_FILE", "feeds.txt"))
     state_path = os.getenv("STATE_FILE", "state.json")
     state = load_state(state_path, allow_new=dry_run)
@@ -50,7 +53,7 @@ def main():
     }
     checkpoint = None if dry_run else lambda current, seen: save_state(current, seen, state_path)
     seen = collect_articles(
-        feeds, state, budget=min(COLLECT_BUDGET, RUN_BUDGET), checkpoint=checkpoint,
+        feeds, state, budget=min(COLLECT_BUDGET, run_budget), checkpoint=checkpoint,
         metrics=metrics, max_age_seconds=freshness_window_seconds,
     )
 
@@ -97,7 +100,7 @@ def main():
         _log_phase51_metrics(metrics)
         return
 
-    remaining = max(0, RUN_BUDGET - (time.monotonic() - run_started))
+    remaining = max(0, run_budget - (time.monotonic() - run_started))
     process_queue(
         state, seen, token, chat_id, state_path=state_path, dry_run=False,
         interval_seconds=interval_seconds, time_limit=remaining, metrics=metrics,

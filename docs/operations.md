@@ -119,3 +119,16 @@ un refus : ne jamais supprimer l'état ou réinitialiser la file pour la contour
 
 Ne pas lancer manuellement `tools/persistence_health.py probe/sync` contre la
 production sans autorisation. `DRY_RUN=1` rend ces commandes sans écriture.
+
+
+### Mode dégradé si seule l'API Actions est indisponible
+
+Une erreur de lecture d'historique retourne `mode=degraded`. Le même passage
+prépare une sonde et exige son push ET sa vérification distante avant d'exécuter
+publish. Si cette vérification échoue, publish reste skipped. Si elle réussit,
+la publication bornée reprend immédiatement, sans attendre le retour de l'API.
+La sonde n'utilise pas de credential Telegram ; celui-ci reste limité au step
+publish. Budget de publication réduit d'une minute dans ce seul mode afin de
+réserver la vérification Git supplémentaire, limite du job inchangée.
+Un 429 valide sans retry_after est reporté de 15 minutes comme rejet certain,
+sans incertitude ni quarantaine ; le délai entier positif fourni prime toujours.

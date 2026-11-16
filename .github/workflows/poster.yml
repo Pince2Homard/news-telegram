@@ -40,18 +40,23 @@ jobs:
         run: python tools/persistence_health.py gate >> "$GITHUB_OUTPUT"
       - name: Contrôler la persistance sans Telegram
         id: probe
-        if: steps.health.outputs.mode == 'recovery'
+        if: steps.health.outputs.mode == 'recovery' || steps.health.outputs.mode == 'degraded'
         run: python tools/persistence_health.py probe
+      - name: Vérifier la sonde distante avant publication dégradée
+        id: checkpoint
+        if: steps.health.outputs.mode == 'degraded' && steps.probe.outcome == 'success'
+        run: python tools/persistence_health.py sync
       - name: Publier les articles
         id: publish
-        if: steps.health.outputs.mode == 'normal'
+        if: steps.health.outputs.mode == 'normal' || (steps.health.outputs.mode == 'degraded' && steps.checkpoint.outcome == 'success')
         run: python poster.py
         env:
           DRY_RUN: "0"
           ALLOW_TELEGRAM_SEND: "1"
+          PERSISTENCE_MODE: ${{ steps.health.outputs.mode }}
           TELEGRAM_INTERVAL_SECONDS: ${{ vars.TELEGRAM_INTERVAL_SECONDS || '30' }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT: ${{ secrets.TELEGRAM_CHAT }}
       - name: Sauvegarder l'état de la file d'attente
-        if: always() && steps.health.outcome == 'success' && (steps.publish.outcome != 'skipped' || steps.probe.outcome == 'success')
+        if: always() && steps.health.outcome == 'success' && (steps.publish.outcome != 'skipped' || (steps.health.outputs.mode == 'recovery' && steps.probe.outcome == 'success'))
         run: python tools/persistence_health.py sync

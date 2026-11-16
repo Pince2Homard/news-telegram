@@ -18,7 +18,11 @@ Décision : [rapport validé](https://github.com/Pince2Homard/news-telegram/issu
   `retry_exhausted_possible_delivery`, contenu et compteur conservés.
   Les autres articles reprennent automatiquement au prochain passage normal.
 - Rejet 429 valide : attente intégrale si elle tient dans la réserve existante,
-  sinon report sans augmenter le compteur d'incertitudes. 401/403, destination
+  sinon report sans augmenter le compteur d'incertitudes. Si l'enveloppe est
+  un rejet valide mais le délai est absent/invalide, report conservateur de
+  900 secondes, classification `rejected`, un seul appel et aucun compteur
+  d'incertitude consommé. Tout délai entier positif fourni reste intégralement
+  respecté. 401/403, destination
   inattendue et défauts globaux préservent toute la file. Seules des erreurs
   d'article reconnues (texte trop long/vide, entités invalides) sont isolées.
 - DRY_RUN prioritaire, ALLOW obligatoire, groupe de concurrence, FIFO normale,
@@ -30,11 +34,22 @@ Décision : [rapport validé](https://github.com/Pince2Homard/news-telegram/issu
 Le helper `tools/persistence_health.py` a trois modes, sans fonction d'envoi :
 `gate`, `probe`, `sync`. Le précédent passage pertinent est sélectionné parmi
 les passages terminés, par date de mise à jour, avec sa tentative. Rerun,
-passage interrompu/échoué, absence de preuve de persistance ou erreur API
-entraînent un passage de santé. Celui-ci ne collecte pas et n'utilise aucun
-credential Telegram. Une réussite permet la reprise au passage suivant ; une
-panne persistante provoque de nouveaux essais sans Telegram, sans boucle serrée.
-La recherche est bornée à 100 passages : historique non déterminable = santé.
+passage interrompu/échoué et absence de preuve de persistance entraînent un
+passage de santé sans publication ; une réussite permet la reprise suivante.
+La recherche reste bornée à 100 passages.
+
+Une API Actions indisponible ou inexploitable produit désormais `degraded`.
+Dans ce cas, le même passage prépare une sonde puis la synchronise et vérifie
+son contenu distant AVANT toute publication. Le step publish ne s'exécute que
+si le step checkpoint réussit. Échec de la sonde, du push ou de la vérification :
+aucun credential Telegram injecté dans une étape exécutée, aucune publication.
+La preuve doit être fraîche : un ancien marqueur ne suffit pas. Cette route
+permet de publier à chaque passage malgré une panne API prolongée lorsque Git
+fonctionne. La sonde et le checkpoint n'importent aucun sender. Le résultat final
+de publication est ensuite synchronisé normalement, même après erreur Python.
+Les garde-fous pour rerun ou autre run in_progress restent en mode `recovery`,
+pas en mode dégradé. Aucun manifeste ni permission supplémentaire.
+
 
 La synchronisation ne modifie que state.json, sur main. Trois tentatives et un
 budget de 60 secondes, sous-commandes limitées à 15 secondes. Pas de force-push.
@@ -65,8 +80,11 @@ La rétention d'erreurs est bornée ; son élagage est compté et journalisé.
 
 Coûts : copies/validation JSON à chaque checkpoint, jusqu'à 6 secondes d'attente
 supplémentaire en cas d'écriture transitoire, deux lectures API Actions usuelles,
-un checkpoint final normal. Un incident peut ajouter un passage sans émission
-et un commit de santé. Les timeouts Requests ne sont pas une échéance réseau
+un checkpoint final normal. Un incident connu peut ajouter un passage sans
+émission et un commit de santé. En mode dégradé API, un checkpoint supplémentaire
+précède la publication : jusqu'à deux commits dans ce passage. Le budget du
+processus est réduit de 720 à 660 secondes pour réserver les 60 secondes de
+vérification préalable ; le plafond Actions reste 14 minutes. Les timeouts Requests ne sont pas une échéance réseau
 absolue ; le budget du run et la limite Actions de 14 minutes restent en place.
 Aucune qualification WAN/Telegram réelle n'est revendiquée.
 

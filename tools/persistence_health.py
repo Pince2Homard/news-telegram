@@ -14,28 +14,35 @@ from newsbot.persistence import load_state, save_state  # noqa: E402
 STEP = "Sauvegarder l'état de la file d'attente"
 
 
-def recovery_required(repo, run_id, attempt, get):
+def recovery_mode(repo, run_id, attempt, get):
     if int(attempt) != 1:
-        return True
+        return "recovery"
     try:
         runs = get(f"/repos/{repo}/actions/workflows/poster.yml/runs?branch=main&per_page=100")
         if any(str(r["id"]) != str(run_id) and r["status"] == "in_progress"
                for r in runs["workflow_runs"]):
-            return True
+            return "recovery"
         completed = [r for r in runs["workflow_runs"]
                      if str(r["id"]) != str(run_id) and r["status"] == "completed"]
         if not completed:
-            return True
+            return "recovery"
         previous = max(completed, key=lambda r: r["updated_at"])
         if previous["conclusion"] != "success":
-            return True
+            return "recovery"
         jobs = get(f"/repos/{repo}/actions/runs/{previous['id']}/attempts/"
                    f"{previous['run_attempt']}/jobs")
-        return not any(j["conclusion"] == "success" and any(
+        healthy = any(j["conclusion"] == "success" and any(
             s["name"] == STEP and s["conclusion"] == "success" for s in j["steps"]
         ) for j in jobs["jobs"])
+        return "normal" if healthy else "recovery"
     except (KeyError, TypeError, ValueError, requests.RequestException):
-        return True
+        # Only an unavailable/unusable history permits the degraded route.
+        # A fresh Git checkpoint must succeed before this run may publish.
+        return "degraded"
+
+
+def recovery_required(repo, run_id, attempt, get):
+    return recovery_mode(repo, run_id, attempt, get) != "normal"
 
 
 def probe(path, run_id, attempt):
@@ -108,10 +115,10 @@ def main():
                 raise ValueError("Invalid Actions response")
             return json.loads(response.content)
 
-        recovery = recovery_required(os.environ["GITHUB_REPOSITORY"],
+        mode = recovery_mode(os.environ["GITHUB_REPOSITORY"],
                                      os.environ["GITHUB_RUN_ID"],
                                      os.environ["GITHUB_RUN_ATTEMPT"], get)
-        print("mode=" + ("recovery" if recovery else "normal"))
+        print("mode=" + mode)
     elif mode == "probe":
         probe("state.json", os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"])
     elif mode == "sync":

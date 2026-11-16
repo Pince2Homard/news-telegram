@@ -7,6 +7,7 @@ from . import persistence
 from .admission import _drain_admission_buffer
 from .metrics import _utc_iso, _http_status_from_exception, _http_status_category, _feed_label
 from .network_diagnostics import network_diagnostic
+from .settings import TELEGRAM_FALLBACK_RETRY_AFTER_SECONDS
 
 
 class PermanentTelegramError(Exception):
@@ -133,7 +134,10 @@ def send_message(
             parameters = payload.get("parameters")
             wait = parameters.get("retry_after") if isinstance(parameters, dict) else None
             if type(wait) is not int or wait <= 0:
-                return TelegramSendResult(False, attempt_errors=1)
+                return TelegramSendResult(
+                    False, attempts=attempt + 1, disposition="rejected",
+                    retry_after=TELEGRAM_FALLBACK_RETRY_AFTER_SECONDS,
+                )
             if wait > TELEGRAM_MAX_RETRY_AFTER_SECONDS or attempt == TELEGRAM_MAX_ATTEMPTS - 1:
                 return TelegramSendResult(False, attempts=attempt + 1,
                                           disposition="rejected", retry_after=wait)
