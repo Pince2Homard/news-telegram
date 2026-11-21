@@ -10,6 +10,7 @@ from .admission import _drain_admission_buffer
 from .metrics import _utc_iso, _http_status_from_exception, _http_status_category, _feed_label
 from .network_diagnostics import network_diagnostic
 from .settings import TELEGRAM_FALLBACK_RETRY_AFTER_SECONDS
+from .settings import REMOTE_CHECKPOINT_EVERY, REMOTE_CHECKPOINT_BUDGET_SECONDS
 
 
 def _log_telegram_refusal(status, payload, valid_error, classification, duration, attempt):
@@ -229,11 +230,14 @@ def process_queue(
     sender=send_message, sleep=time.sleep, max_per_run=MAX_PAR_RUN,
     interval_seconds=None, time_limit=11 * 60, clock=time.time,
     monotonic=time.monotonic, metrics=None, save=None,
+    remote_checkpoint=None,
 ):
     """Publie la FIFO avec transport, horloges et sauvegarde injectables.
 
     Mutations : retraits confirmés, erreurs définitives, promotions du tampon et
     métadonnées de cadence. La sauvegarde reçoit (state, seen, state_path).
+    remote_checkpoint() doit retourner seulement après vérification distante,
+    sinon lever une exception. Le contrôleur de production le fournit toujours.
     """
     if dry_run:
         print("DRY-RUN : aucune requête Telegram et aucune sauvegarde.")
@@ -254,6 +258,10 @@ def process_queue(
     save(state, seen, state_path)
     queue_before = len(state["file"])
     sent = 0
+    uncheckpointed = 0
+    max_uncheckpointed = 0
+    remote_checkpoints = 0
+    remote_checkpoint_seconds = 0.0
     cadence_wait_seconds = 0.0
     telegram_errors = 0
     telegram_send_operations = 0
@@ -284,7 +292,10 @@ def process_queue(
             break
         elapsed = monotonic() - started
         remaining_budget = time_limit - elapsed
-        if remaining_budget < MAX_TELEGRAM_SEND_BUDGET_SECONDS:
+        checkpoint_due = remote_checkpoint is not None and uncheckpointed + 1 >= REMOTE_CHECKPOINT_EVERY
+        operation_reserve = MAX_TELEGRAM_SEND_BUDGET_SECONDS + (
+            REMOTE_CHECKPOINT_BUDGET_SECONDS if checkpoint_due else 0)
+        if remaining_budget < operation_reserve:
             print(
                 "PUBLICATION REPORTÉE | raison: budget_insuffisant",
                 "| file:", len(state["file"]),
@@ -308,7 +319,7 @@ def process_queue(
                     "| prochaine_publication_utc:", _utc_iso(next_allowed),
                 )
                 break
-            if wait_seconds + MAX_TELEGRAM_SEND_BUDGET_SECONDS > remaining_budget:
+            if wait_seconds + operation_reserve > remaining_budget:
                 print(
                     "PUBLICATION REPORTÉE | raison: budget_insuffisant_avant_prochaine_cadence",
                     "| file:", len(state["file"]),
@@ -330,6 +341,11 @@ def process_queue(
                 )
                 break
 
+        # A sleep or a local checkpoint may overrun its estimated duration.
+        # Never start a new POST based on the pre-sleep budget snapshot.
+        if time_limit - (monotonic() - started) < operation_reserve:
+            print("PUBLICATION REPORTÉE | raison: budget_après_attente")
+            break
         item = state["file"][0]
         call_started = monotonic()
         telegram_send_operations += 1
@@ -423,6 +439,8 @@ def process_queue(
             successful_intervals.append(round(successful_at - previous_success, 3))
         state["file"].pop(0)
         sent += 1
+        uncheckpointed += 1
+        max_uncheckpointed = max(max_uncheckpointed, uncheckpointed)
         state["last_successful_send_at"] = successful_at
         state["last_successful_message_id"] = message_id
         promoted_during_publication += _drain_admission_buffer(state, successful_at)
@@ -437,6 +455,19 @@ def process_queue(
                 "| doublon_possible_après_reprise: oui",
             )
             raise
+        if remote_checkpoint is not None and uncheckpointed >= REMOTE_CHECKPOINT_EVERY:
+            checkpoint_started = monotonic()
+            try:
+                remote_checkpoint()
+            except Exception as exc:
+                print("ARRÊT CHECKPOINT DISTANT | confirmations_non_synchronisées:",
+                      uncheckpointed, "| erreur:", type(exc).__name__)
+                raise RuntimeError("Checkpoint distant non vérifié : publication arrêtée") from None
+            remote_checkpoint_seconds += max(0.0, monotonic() - checkpoint_started)
+            remote_checkpoints += 1
+            uncheckpointed = 0
+            print("CHECKPOINT DISTANT VÉRIFIÉ | publiés_confirmés:", sent,
+                  "| durée_s:", round(monotonic() - checkpoint_started, 3))
         next_allowed = successful_at + interval
         queue_max = max(queue_max, len(state["file"]))
         print(
@@ -476,6 +507,10 @@ def process_queue(
                 )) + promoted_during_publication
             ),
             "published": sent,
+            "remote_checkpoints": remote_checkpoints,
+            "remote_checkpoint_seconds": round(remote_checkpoint_seconds, 3),
+            "confirmed_since_remote_checkpoint": uncheckpointed,
+            "max_confirmed_since_remote_checkpoint": max_uncheckpointed,
             "publication_deferred": len(remaining),
             "publication_seconds": publication_duration,
             "cadence_wait_seconds": round(cadence_wait_seconds, 3),
