@@ -1,5 +1,7 @@
 """Publication FIFO et reprise bornée des résultats incertains."""
 import time
+import json
+import math
 from dataclasses import dataclass
 import requests
 from .settings import DEFAULT_TELEGRAM_INTERVAL_SECONDS as DEFAULT_TELEGRAM_INTERVAL_SECONDS, MAX_INLINE_CADENCE_WAIT_SECONDS, TELEGRAM_REQUEST_TIMEOUT_SECONDS, TELEGRAM_MAX_ATTEMPTS, TELEGRAM_MAX_RETRY_AFTER_SECONDS, MAX_TELEGRAM_SEND_BUDGET_SECONDS, MAX_PAR_RUN, get_telegram_interval_seconds
@@ -8,6 +10,37 @@ from .admission import _drain_admission_buffer
 from .metrics import _utc_iso, _http_status_from_exception, _http_status_category, _feed_label
 from .network_diagnostics import network_diagnostic
 from .settings import TELEGRAM_FALLBACK_RETRY_AFTER_SECONDS
+
+
+def _log_telegram_refusal(status, payload, valid_error, classification, duration, attempt):
+    """Diagnostic only: bounded values, never a free description or response body."""
+    try:
+        reason = "invalid_response"
+        if valid_error:
+            reason = _http_status_category(status)
+            if status == 400:
+                reason = "unknown_400"
+                description = str(payload.get("description", "")).lower()
+                for fragment, category in (
+                    ("chat not found", "chat_not_found"),
+                    ("message is too long", "too_long"),
+                    ("message text is empty", "empty"),
+                    ("can't parse entities", "parse_entities"),
+                ):
+                    if fragment in description:
+                        reason = category
+                        break
+        print("TELEGRAM_REFUSAL |", json.dumps({
+            "http_status": status if type(status) is int and 100 <= status <= 599 else None,
+            "reason": reason,
+            "classification": classification,
+            "duration_seconds": round(min(86400, max(0, duration)), 3)
+            if math.isfinite(duration) else None,
+            "attempt": min(TELEGRAM_MAX_ATTEMPTS, max(1, attempt)),
+        }, sort_keys=True, separators=(",", ":")))
+    except Exception:
+        # A diagnostic failure must not change a publication decision.
+        pass
 
 
 class PermanentTelegramError(Exception):
@@ -125,12 +158,14 @@ def send_message(
                      and type(date) is int and 0 < date <= clock() + 300
                      and destination_ok)
             if not valid:
+                _log_telegram_refusal(status, payload, False, "uncertain", duration, attempt + 1)
                 return TelegramSendResult(False, attempt_errors=1)
             print("TELEGRAM tentative | début_utc:", _utc_iso(attempt_at),
                   "| résultat: succès | durée_s:", round(duration, 3), "| message_id:", mid)
             return TelegramSendResult(True, mid, date, attempt + 1, attempt_errors,
                                       request_duration, http_errors, disposition="confirmed")
         if status == 429 and valid_error:
+            _log_telegram_refusal(status, payload, True, "rejected", duration, attempt + 1)
             parameters = payload.get("parameters")
             wait = parameters.get("retry_after") if isinstance(parameters, dict) else None
             if type(wait) is not int or wait <= 0:
@@ -149,8 +184,10 @@ def send_message(
             # Even an invalid error envelope must not exhaust every article
             # when credentials/permissions are suspect. This is a global stop,
             # not a claim that the malformed response proves non-acceptance.
+            _log_telegram_refusal(status, payload, valid_error, "global", duration, attempt + 1)
             raise GlobalTelegramError(f"HTTP {status}", http_status=status)
         if not valid_error:
+            _log_telegram_refusal(status, payload, False, "uncertain", duration, attempt + 1)
             return TelegramSendResult(False, attempt_errors=1)
 
         message = f"HTTP {status}"
@@ -166,13 +203,17 @@ def send_message(
         )
         if status in (401, 403) or (status == 400 and
                 "chat not found" in str(payload.get("description", "")).lower()):
+            _log_telegram_refusal(status, payload, True, "global", duration, attempt + 1)
             raise GlobalTelegramError(message, http_status=status)
         if isinstance(status, int) and 400 <= status < 500:
             description = str(payload.get("description", "")).lower()
             if status == 400 and any(reason in description for reason in (
                     "message is too long", "message text is empty", "can't parse entities")):
+                _log_telegram_refusal(status, payload, True, "permanent", duration, attempt + 1)
                 raise PermanentTelegramError(message, http_status=status)
+            _log_telegram_refusal(status, payload, True, "global", duration, attempt + 1)
             raise GlobalTelegramError(message, http_status=status)
+        _log_telegram_refusal(status, payload, True, "uncertain", duration, attempt + 1)
         return TelegramSendResult(
             False, attempts=attempt + 1, attempt_errors=attempt_errors,
             duration_seconds=request_duration, http_errors=http_errors,
