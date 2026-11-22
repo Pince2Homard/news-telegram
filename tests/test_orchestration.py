@@ -69,6 +69,8 @@ class OrchestrationTests(unittest.TestCase):
                         clock=clock, monotonic=clock,
                     )), patch.object(cadence_simulator, "build_simulation",
                                      side_effect=AssertionError("simulation hors production")), \
+                    contextlib.chdir(directory), \
+                    patch.object(poster, "checkpoint_remote"), \
                     contextlib.redirect_stdout(io.StringIO()):
                 poster.main()
             return sent_at, persistence.load_state(state_path), before, state_path.read_bytes()

@@ -67,7 +67,7 @@ class WorkflowRouteTests(unittest.TestCase):
 
     def test_degraded_run_reserves_preflight_time(self):
         import poster
-        for mode, expected in (('normal', 720), ('degraded', 660)):
+        for mode, expected in (('normal', 900), ('degraded', 840)):
             state = {'file': [], 'vus': []}
             with patch.dict('os.environ', {'DRY_RUN': '0', 'ALLOW_TELEGRAM_SEND': '1',
                             'TELEGRAM_TOKEN': 'synthetic', 'TELEGRAM_CHAT': '42',
